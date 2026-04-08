@@ -14,3 +14,6 @@ tsconfig.tsbuildinfo
 .scaffold
 build
 logs
+
+# Documentation (plans, specs - working documents)
+docs/superpowers/
