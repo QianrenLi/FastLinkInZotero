@@ -1,10 +1,10 @@
-startup-begin = Addon is loading
-startup-finish = Addon is ready
-menuitem-label = Addon Template: Helper Examples
-menupopup-label = Addon Template: Menupopup
-menuitem-submenulabel = Addon Template
-menuitem-filemenulabel = Addon Template: File Menuitem
-prefs-title = Template
+startup-begin = FastLink is loading
+startup-finish = FastLink is ready
+menuitem-label = FastLink: Helper Examples
+menupopup-label = FastLink: Menupopup
+menuitem-submenulabel = FastLink
+menuitem-filemenulabel = FastLink: File Menuitem
+prefs-title = FastLink
 prefs-table-title = Title
 prefs-table-detail = Detail
 tabpanel-lib-tab-label = Lib Tab
