@@ -85,10 +85,10 @@ export class KeyExampleFactory {
     ztoolkit.Keyboard.register((ev, keyOptions) => {
       ztoolkit.log(ev, keyOptions.keyboard);
       if (keyOptions.keyboard?.equals("shift,l")) {
-        addon.hooks.onShortcuts("larger");
+        addon.hooks.onDialogEvents("larger");
       }
       if (ev.shiftKey && ev.key === "S") {
-        addon.hooks.onShortcuts("smaller");
+        addon.hooks.onDialogEvents("smaller");
       }
     });
 
@@ -450,7 +450,6 @@ export class PromptExampleFactory {
           const container = prompt.createCommandsContainer();
           container.classList.add("suggestions");
           ids = filter(ids);
-          console.log(ids.length);
           if (ids.length == 0) {
             const s = new Zotero.Search();
             const operators = [
@@ -494,7 +493,6 @@ export class PromptExampleFactory {
             }
           }
           ids = filter(ids);
-          console.log(ids.length);
           if (ids.length > 0) {
             ids.forEach((id: number) => {
               const item = Zotero.Items.get(id);

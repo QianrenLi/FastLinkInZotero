@@ -1,114 +1,164 @@
 // src/modules/popup-controller.ts
-import { debounce } from '../utils/debounce';
+import { debounce } from "../utils/debounce";
+import { escapeHtml, escapeRegex } from "../utils/html";
 
 export interface PopupItem {
   noteId: number;
   title: string;
-  matchType: 'exact' | 'prefix' | 'contains';
+  matchType: "exact" | "prefix" | "contains";
 }
 
 export interface PopupOptions {
-  onSelection: (noteId: number | null, query: string) => void;
+  onSelection: (
+    noteId: number | null,
+    noteTitle: string,
+    searchQuery: string,
+  ) => void;
   onClose: () => void;
 }
 
+const ITEM_STYLE =
+  "padding:7px 12px;cursor:pointer;color:#222;font-size:13px;border-bottom:1px solid #f0f0f0;";
+const CREATE_STYLE =
+  "padding:8px 12px;border-top:1px solid #ddd;cursor:pointer;color:#0066cc;background:#fff;font-size:13px;";
+const CONTAINER_STYLE =
+  "background:#fff;color:#222;border:1px solid #888;border-radius:4px;box-shadow:0 4px 12px rgba(0,0,0,0.25);max-width:350px;overflow:hidden;font-family:-moz-dialog;padding:0;margin:0;";
+
 export class PopupController {
   private element: HTMLElement | null = null;
+  private _innerContainer: HTMLElement | null = null;
   private items: PopupItem[] = [];
   private selectedIndex = 0;
-  private currentQuery = '';
-  private onSelection: (noteId: number | null, query: string) => void;
+  private currentQuery = "";
+  private onSelection: (
+    noteId: number | null,
+    noteTitle: string,
+    searchQuery: string,
+  ) => void;
   private onClose: () => void;
   private debouncedFilter: (query: string) => void;
   private clickHandler: ((e: Event) => void) | null = null;
+  private _clickHandlerBound: ((e: Event) => void) | null = null;
 
   constructor(options: PopupOptions) {
     this.onSelection = options.onSelection;
     this.onClose = options.onClose;
     this.debouncedFilter = debounce((query: string) => {
-      this.refreshDisplay(query);
+      this.render();
     }, 150);
+
+    // Create click handler once, reuse across renders
+    this._clickHandlerBound = (e: Event): void => {
+      const target = e.target as HTMLElement;
+      const itemElement = target.closest(
+        ".fastlink-popup-item, .fastlink-popup-create-new",
+      );
+      if (!itemElement) return;
+
+      if (itemElement.classList.contains("fastlink-popup-create-new")) {
+        this.onSelection(null, this.currentQuery, this.currentQuery);
+      } else {
+        const index = parseInt(
+          itemElement.getAttribute("data-index") || "0",
+          10,
+        );
+        this.selectedIndex = index;
+        this.selectCurrent();
+      }
+    };
   }
 
-  /**
-   * Show popup at cursor position
-   */
   show(x: number, y: number): void {
-    if (!this.element) {
-      this.createPopup();
-    }
+    if (!this.element) this.createPopup();
 
     if (this.element) {
-      this.element.style.left = `${x}px`;
-      this.element.style.top = `${y}px`;
-      this.element.style.display = 'block';
       this.selectedIndex = 0;
+      try {
+        const mainWindow = Zotero.getMainWindow();
+        if (mainWindow) {
+          const clampedX = Math.min(
+            Math.max(x, 10),
+            mainWindow.innerWidth - 360,
+          );
+          (this.element as any).openPopup(
+            mainWindow.document.documentElement,
+            "overlap",
+            clampedX,
+            y,
+            false,
+            false,
+          );
+        }
+      } catch (e) {
+        Zotero.debug(`[FastLink] Popup openPopup error: ${e}`);
+      }
     }
   }
 
-  /**
-   * Hide popup
-   */
   hide(): void {
     if (this.element) {
-      this.element.style.display = 'none';
+      try {
+        (this.element as any).hidePopup();
+      } catch {
+        this.element.style.display = "none";
+      }
     }
   }
 
-  /**
-   * Update popup items
-   */
   setItems(items: PopupItem[]): void {
     this.items = items;
     this.selectedIndex = 0;
     this.render();
   }
 
-  /**
-   * Update query and filter items
-   */
   updateQuery(query: string): void {
     this.currentQuery = query;
     this.debouncedFilter(query);
   }
 
-  /**
-   * Handle keyboard navigation
-   */
   handleKeyDown(event: KeyboardEvent): boolean {
-    if (!this.element || this.element.style.display === 'none') {
-      return false;
+    if (!this.element) return false;
+
+    try {
+      const state = (this.element as any).state;
+      if (state !== "open" && state !== "showing") return false;
+    } catch {
+      if (this.element.style.display !== "block") return false;
     }
 
     switch (event.key) {
-      case 'ArrowDown':
+      case "ArrowDown": {
         event.preventDefault();
-        if (this.items.length > 0) {
-          this.selectedIndex = Math.min(this.selectedIndex + 1, this.items.length - 1);
-          this.render();
+        const maxDown = this.hasCreateOption()
+          ? this.items.length
+          : this.items.length - 1;
+        if (maxDown >= 0) {
+          this.selectedIndex = Math.min(this.selectedIndex + 1, maxDown);
+          this.updateSelectionHighlight();
         }
         return true;
+      }
 
-      case 'ArrowUp':
+      case "ArrowUp":
         event.preventDefault();
-        if (this.items.length > 0) {
+        if (this.selectedIndex > 0) {
           this.selectedIndex = Math.max(this.selectedIndex - 1, 0);
-          this.render();
+          this.updateSelectionHighlight();
         }
         return true;
 
-      case 'Enter':
+      case "Enter":
         event.preventDefault();
         this.selectCurrent();
         return true;
 
-      case 'Escape':
+      case "Escape":
         event.preventDefault();
         this.hide();
         this.onClose();
         return true;
 
-      case 'Tab':
+      case "Tab":
         event.preventDefault();
         this.selectCurrent();
         return true;
@@ -117,180 +167,153 @@ export class PopupController {
     return false;
   }
 
-  /**
-   * Check if popup is visible
-   */
   isVisible(): boolean {
-    return this.element?.style.display === 'block';
+    if (!this.element) return false;
+    try {
+      const state = (this.element as any).state;
+      return state === "open" || state === "showing";
+    } catch {
+      return this.element.style.display === "block";
+    }
   }
 
-  /**
-   * Clean up popup
-   */
   destroy(): void {
     if (this.element) {
-      // Remove click handler before cleaning up element
-      const itemsContainer = this.element.querySelector('.fastlink-popup-content');
-      if (itemsContainer && this.clickHandler) {
-        itemsContainer.removeEventListener('click', this.clickHandler);
+      try {
+        (this.element as any).hidePopup();
+      } catch {
+        // hidePopup may throw if panel is already detached
+      }
+      if (this._clickHandlerBound && this._innerContainer) {
+        this._innerContainer.removeEventListener(
+          "click",
+          this._clickHandlerBound,
+        );
       }
       this.element.remove();
       this.element = null;
     }
+    this._innerContainer = null;
     this.clickHandler = null;
   }
 
-  /**
-   * Create popup DOM element
-   */
   private createPopup(): void {
     const mainWindow = Zotero.getMainWindow();
-    if (!mainWindow) {
-      throw new Error('Zotero main window not available');
-    }
+    if (!mainWindow) throw new Error("Zotero main window not available");
     const doc = mainWindow.document;
-    this.element = doc.createElement('div');
-    this.element.className = 'fastlink-popup';
-    if (doc.body) {
-      doc.body.appendChild(this.element);
+
+    const panel = doc.createXULElement("panel") as HTMLElement;
+    this.element = panel;
+    panel.setAttribute("type", "arrow");
+    panel.setAttribute("flip", "both");
+    panel.setAttribute("rolluponmousewheel", "true");
+    panel.setAttribute("noautofocus", "true");
+    panel.setAttribute("style", "padding: 0; margin: 0;");
+
+    const inner = doc.createElement("div");
+    inner.className = "fastlink-popup-inner";
+    inner.setAttribute("style", CONTAINER_STYLE);
+    panel.appendChild(inner);
+    this._innerContainer = inner;
+
+    // Attach click handler once
+    if (this._clickHandlerBound) {
+      inner.addEventListener("click", this._clickHandlerBound);
     }
 
-    // Load external CSS
-    if (!doc.getElementById('fastlink-popup-styles')) {
-      const link = doc.createElement('link');
-      link.id = 'fastlink-popup-styles';
-      link.rel = 'stylesheet';
-      link.href = 'chrome://fastlink/content/modules/popup.css';
-      if (doc.head) {
-        doc.head.appendChild(link);
-      }
-    }
+    doc.documentElement?.appendChild(panel);
   }
 
-  /**
-   * Refresh display based on query
-   */
-  private refreshDisplay(query: string): void {
-    if (!this.element) return;
-
-    const container = this.element.querySelector('.fastlink-popup-content');
+  private render(): void {
+    const container = this._innerContainer;
     if (!container) return;
 
-    if (!query.trim()) {
-      // Show recent notes when query is empty
-      this.render();
-      return;
-    }
-
-    this.render();
-  }
-
-  /**
-   * Render popup content
-   */
-  private render(): void {
-    if (!this.element) return;
-
-    let html = '<div class="fastlink-popup-header">🔍 Search notes...</div>';
-    html += '<div class="fastlink-popup-content">';
+    let html =
+      '<div style="padding:6px 10px;border-bottom:1px solid #ddd;font-weight:bold;color:#555;font-size:12px;background:#f7f7f7;">Search notes...</div>';
+    html += '<div style="max-height:260px;overflow-y:auto;">';
 
     if (this.items.length === 0) {
-      html += `<div class="fastlink-popup-empty">No matches found</div>`;
-      html += `<div class="fastlink-popup-create-new">+ Create "${this.escapeHtml(this.currentQuery)}"</div>`;
+      html +=
+        '<div style="padding:12px;color:#999;text-align:center;">No matches found</div>';
+      if (this.currentQuery.trim()) {
+        html += this.renderCreateOption("#eee");
+      }
     } else {
       for (let i = 0; i < this.items.length; i++) {
         const item = this.items[i];
-        const selected = i === this.selectedIndex ? 'selected' : '';
+        const bg =
+          i === this.selectedIndex
+            ? "background-color:#e8f0fe;"
+            : "background-color:#fff;";
         const matchHtml = this.highlightMatch(item.title, this.currentQuery);
-
-        html += `
-          <div class="fastlink-popup-item ${selected}" data-index="${i}">
-            <span class="fastlink-popup-item-icon">📄</span>
-            <span class="fastlink-popup-item-title">${matchHtml}</span>
-          </div>
-        `;
+        html += `<div class="fastlink-popup-item" data-index="${i}" style="${ITEM_STYLE}${bg}">${matchHtml}</div>`;
+      }
+      if (this.currentQuery.trim()) {
+        html += this.renderCreateOption("#ddd");
       }
     }
 
-    html += '</div>';
+    html += "</div>";
+    container.innerHTML = html;
+  }
 
-    this.element.innerHTML = html;
-
-    // Add click listeners
-    const itemsContainer = this.element.querySelector('.fastlink-popup-content');
-    if (itemsContainer) {
-      // Remove old listener if exists
-      if (this.clickHandler) {
-        itemsContainer.removeEventListener('click', this.clickHandler);
-      }
-
-      // Create and store new handler
-      this.clickHandler = (e: Event): void => {
-        const target = e.target as HTMLElement;
-        const itemElement = target.closest('.fastlink-popup-item, .fastlink-popup-create-new');
-        if (itemElement) {
-          if (itemElement.classList.contains('fastlink-popup-create-new')) {
-            this.onSelection(null, this.currentQuery);
-          } else {
-            const index = parseInt(itemElement.getAttribute('data-index') || '0', 10);
-            this.selectedIndex = index;
-            this.selectCurrent();
-          }
-        }
-      };
-
-      itemsContainer.addEventListener('click', this.clickHandler);
-    }
+  private renderCreateOption(borderColor: string): string {
+    return `<div class="fastlink-popup-create-new" style="${CREATE_STYLE}border-top:1px solid ${borderColor};">+ Create "${escapeHtml(this.currentQuery)}"</div>`;
   }
 
   /**
-   * Select current item
+   * Update only the selection highlight without full re-render (for arrow keys).
    */
+  private updateSelectionHighlight(): void {
+    const container = this._innerContainer;
+    if (!container) return;
+
+    const items = container.querySelectorAll(".fastlink-popup-item");
+    const createEl = container.querySelector(".fastlink-popup-create-new");
+    const createSelected =
+      this.hasCreateOption() && this.selectedIndex === this.items.length;
+
+    items.forEach((el: Element, i: number) => {
+      (el as HTMLElement).style.backgroundColor =
+        i === this.selectedIndex ? "#e8f0fe" : "#fff";
+    });
+
+    if (createEl) {
+      (createEl as HTMLElement).style.backgroundColor = createSelected
+        ? "#e8f0fe"
+        : "#fff";
+    }
+  }
+
+  private hasCreateOption(): boolean {
+    return this.currentQuery.trim().length > 0;
+  }
+
   private selectCurrent(): void {
-    if (this.items.length === 0) {
-      this.onSelection(null, this.currentQuery);
+    if (
+      this.items.length === 0 ||
+      (this.hasCreateOption() && this.selectedIndex === this.items.length)
+    ) {
+      this.onSelection(null, this.currentQuery, this.currentQuery);
     } else {
-      // Ensure selectedIndex is within bounds
       if (this.selectedIndex < 0 || this.selectedIndex >= this.items.length) {
         this.selectedIndex = 0;
       }
       const item = this.items[this.selectedIndex];
-      this.onSelection(item.noteId, item.title);
+      this.onSelection(item.noteId, item.title, this.currentQuery);
     }
     this.hide();
   }
 
-  /**
-   * Highlight matched text in title
-   */
   private highlightMatch(title: string, query: string): string {
-    if (!query.trim()) return this.escapeHtml(title);
+    const escapedTitle = escapeHtml(title);
+    if (!query.trim()) return escapedTitle;
 
-    const escapedTitle = this.escapeHtml(title);
-    const escapedQuery = this.escapeHtml(query);
-    const regex = new RegExp(`(${this.escapeRegex(escapedQuery)})`, 'gi');
-
-    return escapedTitle.replace(regex, '<span class="fastlink-popup-item-match">$1</span>');
-  }
-
-  /**
-   * Escape HTML
-   */
-  private escapeHtml(text: string): string {
-    const mainWindow = Zotero.getMainWindow();
-    if (!mainWindow || !mainWindow.document) {
-      throw new Error('Zotero main window not available');
-    }
-    const doc = mainWindow.document;
-    const div = doc.createElement('div');
-    div.textContent = text;
-    return String(div.innerHTML);
-  }
-
-  /**
-   * Escape regex special characters
-   */
-  private escapeRegex(text: string): string {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escapedQuery = escapeHtml(query);
+    const regex = new RegExp(`(${escapeRegex(escapedQuery)})`, "gi");
+    return escapedTitle.replace(
+      regex,
+      '<span style="font-weight:bold;color:#1a73e8;">$1</span>',
+    );
   }
 }

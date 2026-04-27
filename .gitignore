@@ -15,5 +15,11 @@ tsconfig.tsbuildinfo
 build
 logs
 
+# Debug logs
+fastlink-debug.log
+
+# Claude Code local settings
+.claude/settings.local.json
+
 # Documentation (plans, specs - working documents)
 docs/superpowers/

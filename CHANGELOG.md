@@ -3,6 +3,7 @@
 ## [0.0.1] - 2026-04-10
 
 ### Added
+
 - Inline autocomplete with `[[` trigger for note linking
 - Quick note creation with Ctrl+N shortcut
 - Smart note search with ranking (exact, prefix, contains)

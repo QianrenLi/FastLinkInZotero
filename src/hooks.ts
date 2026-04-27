@@ -1,11 +1,24 @@
 // src/hooks.ts
-import { NoteLinkAutocomplete } from './modules/note-link-autocomplete';
-import { QuickCreateHandler } from './modules/quick-create-handler';
+import { NoteLinkAutocomplete } from "./modules/note-link-autocomplete";
+import { QuickCreateHandler } from "./modules/quick-create-handler";
+import { NoteSearchService } from "./modules/note-search-service";
+import { LinkInserter } from "./modules/link-inserter";
 import { getString, initLocale } from "./utils/locale";
 import { createZToolkit } from "./utils/ztoolkit";
+import {
+  setupFileLogging,
+  teardownFileLogging,
+  getLogCount,
+  flushLogToFile,
+  getLogContent,
+} from "./utils/file-logger";
 
 let autocomplete: NoteLinkAutocomplete | null = null;
 let quickCreate: QuickCreateHandler | null = null;
+
+// Shared instances — both components use the same service/inserter
+const sharedSearchService = new NoteSearchService();
+const sharedLinkInserter = new LinkInserter();
 
 async function onStartup() {
   await Promise.all([
@@ -14,55 +27,82 @@ async function onStartup() {
     Zotero.uiReadyPromise,
   ]);
 
+  await setupFileLogging();
+
   initLocale();
 
   await Promise.all(
     Zotero.getMainWindows().map((win) => onMainWindowLoad(win)),
   );
 
-  // Initialize FastLink components
   try {
-    autocomplete = new NoteLinkAutocomplete();
+    autocomplete = new NoteLinkAutocomplete(
+      sharedSearchService,
+      sharedLinkInserter,
+    );
     await autocomplete.initialize();
 
-    quickCreate = new QuickCreateHandler();
+    quickCreate = new QuickCreateHandler(
+      sharedSearchService,
+      sharedLinkInserter,
+    );
     await quickCreate.initialize();
 
-    // Register shortcuts after quickCreate is initialized
+    // Register Ctrl+N shortcut
     try {
-      addon.data.ztoolkit.Keyboard.register((ev, keyOptions) => {
-        if (keyOptions.keyboard?.equals('accel,n')) {
-          Zotero.debug('[FastLink] Ctrl+N shortcut triggered');
+      addon.data.ztoolkit.Keyboard.register((ev, _keyOptions) => {
+        try {
+          if (ev.type !== "keydown") return false;
+
+          const accelKey = ev.ctrlKey || ev.metaKey;
+          if (!accelKey || ev.key.toLowerCase() !== "n") return false;
+
+          const target = ev.target as HTMLElement;
+          if (!target?.isContentEditable) return false;
+
           if (quickCreate) {
             void quickCreate.handleQuickCreate();
+            ev.preventDefault();
+            ev.stopPropagation();
+            return true;
           }
+          return false;
+        } catch (error) {
+          Zotero.debug(`[FastLink] Error in keyboard callback: ${error}`);
+          return false;
         }
       });
-      Zotero.debug('[FastLink] Keyboard shortcut registered successfully');
+
+      Zotero.debug("[FastLink] Keyboard shortcut registered");
     } catch (error) {
       Zotero.debug(`[FastLink] Failed to register keyboard shortcut: ${error}`);
     }
 
-    Zotero.debug('[FastLink] All components initialized');
+    registerDebugMenu();
+    Zotero.debug("[FastLink] All components initialized");
   } catch (e) {
     Zotero.debug(`[FastLink] Error during initialization: ${e}`);
   }
 
   addon.data.initialized = true;
+
+  (addon.data as any).getLogCount = getLogCount;
+  (addon.data as any).getLogContent = getLogContent;
+  (addon.data as any).flushLogToFile = flushLogToFile;
 }
 
-async function onMainWindowLoad(win: _ZoteroTypes.MainWindow): Promise<void> {
+function onMainWindowLoad(win: _ZoteroTypes.MainWindow): void {
   win.MozXULElement.insertFTLIfNeeded(
     `${addon.data.config.addonRef}-mainWindow.ftl`,
   );
 }
 
-async function onMainWindowUnload(win: Window): Promise<void> {
+function onMainWindowUnload(win: Window): void {
   addon.data.ztoolkit.unregisterAll();
 }
 
 function onShutdown(): void {
-  // Clean up FastLink components
+  teardownFileLogging();
   autocomplete?.destroy();
   quickCreate?.destroy();
   quickCreate = null;
@@ -74,13 +114,7 @@ function onShutdown(): void {
   delete Zotero[addon.data.config.addonInstance];
 }
 
-function onShortcuts(type: string) {
-  if (type === 'quickCreate' && quickCreate) {
-    void quickCreate.handleQuickCreate();
-  }
-}
-
-async function onNotify(
+function onNotify(
   event: string,
   type: string,
   ids: Array<string | number>,
@@ -89,12 +123,80 @@ async function onNotify(
   // Notifier is handled by NoteLinkAutocomplete
 }
 
-async function onPrefsEvent(type: string, data: { [key: string]: any }) {
+function onPrefsEvent(type: string, data: { [key: string]: any }) {
   // No prefs to handle
 }
 
 function onDialogEvents(type: string) {
   // No dialog events
+}
+
+function registerDebugMenu() {
+  try {
+    addon.data.ztoolkit.Menu.register("menuTools", {
+      tag: "menuseparator",
+    });
+
+    addon.data.ztoolkit.Menu.register("menuTools", {
+      tag: "menuitem",
+      id: "fastlink-test",
+      label: "Test FastLink",
+      oncommand: `
+        (function() {
+          const mainWindow = Zotero.getMainWindow();
+          mainWindow.alert(
+            '[FastLink] Plugin Status:\\n' +
+            'Initialized: ${addon.data.initialized}\\n' +
+            'If you see this, FastLink is loaded!'
+          );
+        })();
+      `,
+    });
+
+    addon.data.ztoolkit.Menu.register("menuTools", {
+      tag: "menuitem",
+      id: "fastlink-save-log",
+      label: "FastLink: Save Debug Log",
+      oncommand: `
+        (async function() {
+          const mainWindow = Zotero.getMainWindow();
+          const data = Zotero.FastLink.data;
+          const count = data.getLogCount();
+          if (count === 0) {
+            mainWindow.alert('[FastLink] No log messages captured yet.');
+            return;
+          }
+          const ok = await data.flushLogToFile();
+          if (ok) {
+            mainWindow.alert('[FastLink] Saved ' + count + ' log lines to file.');
+          } else {
+            const content = data.getLogContent();
+            mainWindow.alert('[FastLink] File write failed. Log:\\n\\n' + content.substring(0, 3000));
+          }
+        })();
+      `,
+    });
+
+    addon.data.ztoolkit.Menu.register("menuTools", {
+      tag: "menuitem",
+      id: "fastlink-view-log",
+      label: "FastLink: View Debug Log",
+      oncommand: `
+        (function() {
+          const mainWindow = Zotero.getMainWindow();
+          const data = Zotero.FastLink.data;
+          const content = data.getLogContent();
+          if (!content) {
+            mainWindow.alert('[FastLink] No log messages captured.');
+            return;
+          }
+          mainWindow.alert('[FastLink] Debug Log (' + content.split('\\n').length + ' lines):\\n\\n' + content.substring(0, 3000));
+        })();
+      `,
+    });
+  } catch (error) {
+    Zotero.debug(`[FastLink] Failed to register debug menu: ${error}`);
+  }
 }
 
 export default {
@@ -104,6 +206,5 @@ export default {
   onMainWindowUnload,
   onNotify,
   onPrefsEvent,
-  onShortcuts,
   onDialogEvents,
 };
