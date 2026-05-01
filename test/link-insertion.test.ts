@@ -1,6 +1,7 @@
 import { assert } from "chai";
 import { LinkInserter } from "../src/modules/link-inserter";
 import { createNote } from "../src/modules/note-link-autocomplete";
+import { getPref, setPref } from "../src/utils/prefs";
 
 describe("link-insertion", function () {
   describe("LinkInserter - HTML Replacement", function () {
@@ -22,8 +23,7 @@ describe("link-insertion", function () {
 
     it("should replace [[query with link in plain text HTML", function () {
       const html = "<p>Before [[query after</p>";
-      const linkHtml =
-        '<a href="zotero://select/library/items/ABC123">query</a>';
+      const linkHtml = '<a href="zotero://note/u/ABC123/">query</a>';
 
       const result = replaceInHtml(html, "[[query", linkHtml);
       assert.isNotNull(result);
@@ -36,8 +36,7 @@ describe("link-insertion", function () {
     it("should replace cross-tag [[query where text after brackets spans tags", function () {
       // [[ is a literal string, but "query" is split by a tag
       const html = "<p>Before [[<b>query</b> after</p>";
-      const linkHtml =
-        '<a href="zotero://select/library/items/ABC123">query</a>';
+      const linkHtml = '<a href="zotero://note/u/ABC123/">query</a>';
 
       const result = replaceInHtml(html, "[[query", linkHtml);
       assert.isNotNull(result);
@@ -48,8 +47,7 @@ describe("link-insertion", function () {
 
     it("should return null when trigger is not found", function () {
       const html = "<p>No trigger here</p>";
-      const linkHtml =
-        '<a href="zotero://select/library/items/ABC123">query</a>';
+      const linkHtml = '<a href="zotero://note/u/ABC123/">query</a>';
 
       const result = replaceInHtml(html, "[[query", linkHtml);
       assert.isNull(result);
@@ -62,8 +60,7 @@ describe("link-insertion", function () {
 
     it("should replace the last [[ occurrence when multiple exist", function () {
       const html = "<p>First [[one and second [[query end</p>";
-      const linkHtml =
-        '<a href="zotero://select/library/items/ABC123">query</a>';
+      const linkHtml = '<a href="zotero://note/u/ABC123/">query</a>';
 
       const result = replaceInHtml(html, "[[query", linkHtml);
       assert.isNotNull(result);
@@ -103,6 +100,7 @@ describe("link-insertion", function () {
     this.timeout(30000);
 
     const createdNotes: Zotero.Item[] = [];
+    let originalMode: string;
 
     async function createTestNote(content: string): Promise<Zotero.Item> {
       const note = new Zotero.Item("note");
@@ -124,12 +122,18 @@ describe("link-insertion", function () {
       createdNotes.length = 0;
     }
 
+    before(function () {
+      originalMode = getPref("linkMode");
+    });
+
     after(async function () {
+      setPref("linkMode", originalMode as any);
       await cleanupNotes();
     });
 
     it("should insert link using preCapturedHtml (liveHtml)", async function () {
       const libraryID = Zotero.Libraries.userLibraryID;
+      setPref("linkMode", "better-notes");
 
       // Create source note with [[query in its content
       const sourceNote = await createTestNote(
@@ -160,7 +164,7 @@ describe("link-insertion", function () {
       const updated = await Zotero.Items.getAsync(sourceNote.id);
       const html = updated.getNote();
 
-      assert.include(html, `zotero://select/library/items/${targetNote!.key}`);
+      assert.include(html, `zotero://note/u/${targetNote!.key}/`);
       assert.include(html, ">query</a>");
       assert.include(html, "Some text");
       assert.include(html, "more text");
@@ -169,6 +173,7 @@ describe("link-insertion", function () {
 
     it("should preserve all surrounding content when inserting link", async function () {
       const libraryID = Zotero.Libraries.userLibraryID;
+      setPref("linkMode", "better-notes");
 
       const sourceNote = await createTestNote(
         "<h1>Title</h1><p>Paragraph one</p><p>Link: [[target here</p><p>Paragraph two</p>",
@@ -193,11 +198,13 @@ describe("link-insertion", function () {
       assert.include(html, "<h1>Title</h1>");
       assert.include(html, "Paragraph one");
       assert.include(html, "Paragraph two");
-      assert.include(html, `zotero://select/library/items/${targetNote!.key}`);
+      assert.include(html, `zotero://note/u/${targetNote!.key}/`);
       assert.notInclude(html, "[[target");
     });
 
     it("link insertion should not be affected by creating a new note (main doc)", async function () {
+      setPref("linkMode", "better-notes");
+
       // This is the critical test for requirement 3:
       // Even when createNote() is called (which may change the editor context),
       // the link insertion must still work correctly on the original source note.
@@ -244,7 +251,7 @@ describe("link-insertion", function () {
       // The link should be inserted
       assert.include(
         sourceHtml,
-        `zotero://select/library/items/${newNote!.key}`,
+        `zotero://note/u/${newNote!.key}/`,
         "Source should contain link to new note",
       );
       assert.include(
@@ -278,8 +285,37 @@ describe("link-insertion", function () {
       );
     });
 
+    it("should use zotero://select format when linkMode is select", async function () {
+      const libraryID = Zotero.Libraries.userLibraryID;
+      setPref("linkMode", "select");
+
+      const sourceNote = await createTestNote(
+        "<p>Select mode test [[query end</p>",
+      );
+      const targetNote = await createNote(libraryID, "query");
+      createdNotes.push(targetNote!);
+
+      const inserter = new LinkInserter();
+      const result = await inserter.insertLink({
+        noteId: targetNote!.id,
+        noteTitle: "query",
+        triggerText: "query",
+        liveHtml: sourceNote.getNote(),
+        sourceNoteId: sourceNote.id,
+      });
+
+      assert.isTrue(result, "Should succeed in select mode");
+
+      const updated = await Zotero.Items.getAsync(sourceNote.id);
+      const html = updated.getNote();
+      assert.include(html, `zotero://select/library/items/${targetNote!.key}`);
+      assert.notInclude(html, "zotero://note");
+      assert.notInclude(html, "[[query");
+    });
+
     it("should handle link insertion with empty liveHtml (fallback to cleanHtml)", async function () {
       const libraryID = Zotero.Libraries.userLibraryID;
+      setPref("linkMode", "better-notes");
 
       const sourceNote = await createTestNote(
         "<p>Fallback test [[query end</p>",
@@ -300,11 +336,13 @@ describe("link-insertion", function () {
 
       const updated = await Zotero.Items.getAsync(sourceNote.id);
       const html = updated.getNote();
-      assert.include(html, `zotero://select/library/items/${targetNote!.key}`);
+      assert.include(html, `zotero://note/u/${targetNote!.key}/`);
       assert.notInclude(html, "[[query");
     });
 
     it("should insert link with sourceNoteId even when no note is in selection", async function () {
+      setPref("linkMode", "better-notes");
+
       // Simulates reader mode: no note in getSelectedItems(),
       // but sourceNoteId was captured from context pane editor.
       const libraryID = Zotero.Libraries.userLibraryID;
@@ -335,7 +373,7 @@ describe("link-insertion", function () {
 
       const updated = await Zotero.Items.getAsync(sourceNote.id);
       const html = updated.getNote();
-      assert.include(html, `zotero://select/library/items/${targetNote!.key}`);
+      assert.include(html, `zotero://note/u/${targetNote!.key}/`);
       assert.include(html, "Side column test");
       assert.include(html, "link");
       assert.notInclude(html, "[[topic");

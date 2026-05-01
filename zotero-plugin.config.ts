@@ -1,5 +1,14 @@
 import { defineConfig } from "zotero-plugin-scaffold";
+import { copyFileSync, mkdirSync, existsSync } from "fs";
+import { join } from "path";
 import pkg from "./package.json";
+
+const BETTER_NOTES_XPI = join(
+  ".scaffold",
+  "test",
+  "better-notes-for-zotero.xpi",
+);
+const BETTER_NOTES_ID = "Knowledge4Zotero@windingwind.com";
 
 export default defineConfig({
   source: ["src", "addon"],
@@ -41,6 +50,18 @@ export default defineConfig({
 
   test: {
     waitForPlugin: `() => Zotero.${pkg.config.addonInstance}.data.initialized`,
+    hooks: {
+      "test:init": () => {
+        const extDir = join(".scaffold", "test", "profile", "extensions");
+        if (!existsSync(extDir)) mkdirSync(extDir, { recursive: true });
+        if (existsSync(BETTER_NOTES_XPI)) {
+          copyFileSync(
+            BETTER_NOTES_XPI,
+            join(extDir, `${BETTER_NOTES_ID}.xpi`),
+          );
+        }
+      },
+    },
   },
 
   // If you need to see a more detailed log, uncomment the following line:

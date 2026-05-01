@@ -82,3 +82,7 @@ npm run release
 ## Credits
 
 Built with [Zotero Plugin Template](https://github.com/windingwind/zotero-plugin-template)
+
+## TODO
+
+- Auto-detect Better Notes plugin installation and switch link mode accordingly

@@ -1,6 +1,7 @@
 // src/modules/link-inserter.ts
 import { getCurrentNote, getEditorWindow } from "../utils/editor-detector";
 import { escapeHtml } from "../utils/html";
+import { getPref } from "../utils/prefs";
 
 export interface LinkInsertOptions {
   noteId: number;
@@ -32,6 +33,16 @@ export class LinkInserter {
     return this._savedWindow;
   }
 
+  private buildLinkUri(item: Zotero.Item): string {
+    const mode = getPref("linkMode");
+    if (mode === "better-notes") {
+      return item.libraryID === Zotero.Libraries.userLibraryID
+        ? `zotero://note/u/${item.key}/`
+        : `zotero://note/${item.libraryID}/${item.key}/`;
+    }
+    return `zotero://select/library/items/${item.key}`;
+  }
+
   async copyLinkToClipboard(
     noteId: number,
     noteTitle: string,
@@ -40,7 +51,7 @@ export class LinkInserter {
       const item = await Zotero.Items.getAsync(noteId);
       if (!item) return false;
 
-      const linkUri = `zotero://select/library/items/${item.key}`;
+      const linkUri = this.buildLinkUri(item);
       Zotero.Utilities.Internal.copyTextToClipboard(
         `[${noteTitle}](${linkUri})`,
       );
@@ -68,7 +79,7 @@ export class LinkInserter {
       const item = await Zotero.Items.getAsync(noteId);
       if (!item) return false;
 
-      const linkUri = `zotero://select/library/items/${item.key}`;
+      const linkUri = this.buildLinkUri(item);
       const currentNote = sourceNoteId
         ? await Zotero.Items.getAsync(sourceNoteId)
         : getCurrentNote();
