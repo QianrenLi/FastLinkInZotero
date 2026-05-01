@@ -54,9 +54,6 @@ export class QuickCreateHandler {
       isReused = true;
     } else {
       targetNote = await createNote(libraryID, result.title);
-      if (targetNote) {
-        await this.addToQuickNoteCollection(targetNote, libraryID);
-      }
     }
 
     if (targetNote) {
@@ -72,9 +69,6 @@ export class QuickCreateHandler {
           result.title,
         );
       }
-      Zotero.debug(
-        `[FastLink] ${isReused ? "Reused" : "Created"}: ${result.title}`,
-      );
     }
   }
 
@@ -117,31 +111,6 @@ export class QuickCreateHandler {
     }
 
     return { action: "create", title: query };
-  }
-
-  private async addToQuickNoteCollection(
-    note: Zotero.Item,
-    libraryID: number,
-  ): Promise<void> {
-    try {
-      const collections = Zotero.Collections.getByLibrary(libraryID);
-      let quickNoteCol = collections.find((c) => c.name === "Quick Note");
-
-      if (!quickNoteCol) {
-        const newCollection = new Zotero.Collection();
-        (newCollection as any).libraryID = libraryID;
-        newCollection.name = "Quick Note";
-        await newCollection.saveTx();
-        quickNoteCol = newCollection;
-      }
-
-      if (quickNoteCol) {
-        note.addToCollection(quickNoteCol.id);
-        await note.saveTx();
-      }
-    } catch (e) {
-      Zotero.debug(`[FastLink] Error adding to Quick Note collection: ${e}`);
-    }
   }
 
   private generateDefaultTitle(): string {

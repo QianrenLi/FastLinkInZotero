@@ -326,6 +326,7 @@ export class NoteLinkAutocomplete {
       // editor auto-save, and the last writer wins — overwriting the link.
       if (sourceNoteId) {
         await new Promise((resolve) => setTimeout(resolve, 300));
+        this.restoreEditorToNote(sourceNoteId);
       }
     }
 
@@ -454,6 +455,27 @@ export class NoteLinkAutocomplete {
     }));
   }
 
+  private restoreEditorToNote(noteId: number): void {
+    try {
+      const win = Zotero.getMainWindow();
+      const tabType = win.Zotero_Tabs?.selectedType;
+
+      if (tabType === "reader") {
+        // Side-column editor: switch back to the source note
+        const editor = win.ZoteroContextPane?.activeEditor;
+        if (editor) {
+          const item = Zotero.Items.get(noteId);
+          if (item) {
+            editor.mode = "edit";
+            editor.item = item;
+          }
+        }
+      }
+    } catch (e) {
+      Zotero.debug(`[FastLink] Error restoring editor focus: ${e}`);
+    }
+  }
+
   destroy(): void {
     if (this._notifierID) {
       Zotero.Notifier.unregisterObserver(this._notifierID);
@@ -500,7 +522,7 @@ export class NoteLinkAutocomplete {
 }
 
 /**
- * Shared note creation utility.
+ * Shared note creation utility. Adds the note to the "Quick Note" collection.
  */
 export async function createNote(
   libraryID: number,
@@ -515,9 +537,37 @@ export async function createNote(
     newNote.setNote(escapeHtml(title.trim()));
     await newNote.saveTx();
     Zotero.debug(`[FastLink] Created note id=${newNote.id}, title="${title}"`);
+
+    await addToQuickNoteCollection(newNote, libraryID);
+
     return newNote;
   } catch (e) {
     Zotero.debug(`[FastLink] Error creating note: ${e}`);
     return null;
+  }
+}
+
+async function addToQuickNoteCollection(
+  note: Zotero.Item,
+  libraryID: number,
+): Promise<void> {
+  try {
+    const collections = Zotero.Collections.getByLibrary(libraryID);
+    let quickNoteCol = collections.find((c) => c.name === "Quick Note");
+
+    if (!quickNoteCol) {
+      const newCollection = new Zotero.Collection();
+      (newCollection as any).libraryID = libraryID;
+      newCollection.name = "Quick Note";
+      await newCollection.saveTx();
+      quickNoteCol = newCollection;
+    }
+
+    if (quickNoteCol) {
+      note.addToCollection(quickNoteCol.id);
+      await note.saveTx();
+    }
+  } catch (e) {
+    Zotero.debug(`[FastLink] Error adding to Quick Note collection: ${e}`);
   }
 }
