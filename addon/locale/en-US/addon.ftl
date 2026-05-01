@@ -1,11 +1,3 @@
 startup-begin = FastLink is loading
 startup-finish = FastLink is ready
-menuitem-label = FastLink: Helper Examples
-menupopup-label = FastLink: Menupopup
-menuitem-submenulabel = FastLink
-menuitem-filemenulabel = FastLink: File Menuitem
 prefs-title = FastLink
-prefs-table-title = Title
-prefs-table-detail = Detail
-tabpanel-lib-tab-label = Lib Tab
-tabpanel-reader-tab-label = Reader Tab

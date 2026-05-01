@@ -1,11 +1,3 @@
 startup-begin = FastLink 加载中
 startup-finish = FastLink 已就绪
-menuitem-label = FastLink: 帮助工具样例
-menupopup-label = FastLink: 弹出菜单
-menuitem-submenulabel = FastLink：子菜单
-menuitem-filemenulabel = FastLink: 文件菜单
 prefs-title = FastLink
-prefs-table-title = 标题
-prefs-table-detail = 详情
-tabpanel-lib-tab-label = 库标签
-tabpanel-reader-tab-label = 阅读器标签

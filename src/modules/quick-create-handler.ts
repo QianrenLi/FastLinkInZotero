@@ -19,12 +19,11 @@ export class QuickCreateHandler {
   }
 
   private registerShortcut(): void {
-    Zotero.debug("[FastLink] Quick create handler registered");
+    // Cache is already built by shared NoteSearchService instance
   }
 
   async handleQuickCreate(): Promise<void> {
     const win = Zotero.getMainWindow();
-    Zotero.debug("[FastLink] handleQuickCreate called");
     this.linkInserter.saveSelection();
 
     const currentNote = getCurrentNote();

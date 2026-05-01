@@ -160,9 +160,6 @@ export class LinkInserter {
       }
 
       if (newHtml) {
-        Zotero.debug(
-          `[FastLink] insertLink: noteId=${noteId}, noteTitle="${noteTitle}", triggerText="${triggerText}", source=${usedSource}, newHtml=${newHtml.substring(0, 200)}`,
-        );
         const htmlWithoutMarker = this.stripMarkerComments(
           newHtml,
           markerToken,
@@ -181,9 +178,7 @@ export class LinkInserter {
         // If the link is missing, re-apply on the fresh DB state.
         const fresh = await Zotero.Items.getAsync(currentNote.id);
         if (fresh && !fresh.getNote().includes(linkUri)) {
-          Zotero.debug(
-            "[FastLink] insertLink: save was overwritten, retrying on fresh state",
-          );
+          Zotero.debug("[FastLink] Retrying link insertion on fresh state");
           const freshHtml = fresh.getNote();
           const retryTrigger = triggerText ? `[[${triggerText}` : "";
           const retriedHtml = retryTrigger
@@ -195,9 +190,6 @@ export class LinkInserter {
           }
         }
 
-        Zotero.debug(
-          `[FastLink] Link inserted: linked note ${currentNote.id} -> target note ${item.id} (source=${usedSource})`,
-        );
         this.clearSavedSelection();
         return true;
       }

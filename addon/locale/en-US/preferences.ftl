@@ -1,5 +1,2 @@
-pref-title = Addon Template Example
-pref-enable =
-    .label = Enable
-pref-input = Input
+pref-title = FastLink Preferences
 pref-help = { $name } Build { $version } { $time }

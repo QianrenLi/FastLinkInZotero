@@ -12,13 +12,13 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/yourusername/FastLinkInZotero.git"
+    "url": "git+https://github.com/QianrenLi/FastLinkInZotero.git"
   },
-  "author": "Your Name",
+  "author": "QianrenLi",
   "bugs": {
-    "url": "https://github.com/yourusername/FastLinkInZotero/issues"
+    "url": "https://github.com/QianrenLi/FastLinkInZotero/issues"
   },
-  "homepage": "https://github.com/yourusername/FastLinkInZotero#readme",
+  "homepage": "https://github.com/QianrenLi/FastLinkInZotero#readme",
   "license": "AGPL-3.0-or-later",
   "scripts": {
     "start": "zotero-plugin serve",

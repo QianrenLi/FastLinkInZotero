@@ -50,7 +50,7 @@ export class NoteLinkAutocomplete {
     await this.searchService.buildCache();
     this.registerNotifyListeners();
     this.registerKeyboardListener();
-    Zotero.debug("[FastLink] Note link autocomplete initialized");
+    Zotero.debug("[FastLink] Initialized");
   }
 
   private registerNotifyListeners(): void {
@@ -192,7 +192,6 @@ export class NoteLinkAutocomplete {
           now - this.lastKeyTime < NoteLinkAutocomplete.DOUBLE_KEY_TIMEOUT &&
           this.triggerBuffer === "["
         ) {
-          Zotero.debug("[FastLink] Double [[ detected");
           this.saveCursorPosition();
           this.triggerAutocomplete();
           this.triggerBuffer = "";
@@ -242,7 +241,6 @@ export class NoteLinkAutocomplete {
         range.startContainer.textContent?.substring(0, range.startOffset) || "";
 
       if (textContent.endsWith("[[") && !this.isActive) {
-        Zotero.debug("[FastLink] Detected [[ via input event (backup)");
         this.triggerAutocomplete();
       }
     } catch (e) {
@@ -294,7 +292,7 @@ export class NoteLinkAutocomplete {
 
     if (!sourceNoteId) {
       Zotero.debug(
-        `[FastLink] handleSelection: could not determine source note — liveHtml length=${liveHtml.length}, editorWin=${!!editorWin}`,
+        "[FastLink] handleSelection: could not determine source note",
       );
     }
 
@@ -516,9 +514,7 @@ export async function createNote(
     // block-element closing tags - wrapping in <h1> breaks this.
     newNote.setNote(escapeHtml(title.trim()));
     await newNote.saveTx();
-    Zotero.debug(
-      `[FastLink] Created note id=${newNote.id}, title="${title}", noteContent="${newNote.getNote()}", extractedTitle="${newNote.getNoteTitle()}"`,
-    );
+    Zotero.debug(`[FastLink] Created note id=${newNote.id}, title="${title}"`);
     return newNote;
   } catch (e) {
     Zotero.debug(`[FastLink] Error creating note: ${e}`);
