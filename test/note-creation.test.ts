@@ -54,6 +54,45 @@ describe("note-creation", function () {
       createdNotes.push(note!);
     });
 
+    it("should start the note with a first-level heading when triggered from [[", async function () {
+      const libraryID = Zotero.Libraries.userLibraryID;
+      const title = "Heading Note";
+      const note = await createNote(libraryID, title, { withHeading: true });
+
+      assert.isNotNull(note);
+      const noteContent = note!.getNote();
+      assert.include(
+        noteContent,
+        "<h1>Heading Note</h1>",
+        "Note content should start with an <h1> heading",
+      );
+      // noteToTitle() must still resolve the title from inside the heading
+      assert.equal(
+        note!.getField("title"),
+        "Heading Note",
+        "Title field should still be extracted from the heading",
+      );
+      assert.equal(note!.getNoteTitle(), "Heading Note");
+
+      createdNotes.push(note!);
+    });
+
+    it("should start with a heading even when the title has special chars", async function () {
+      const libraryID = Zotero.Libraries.userLibraryID;
+      const title = 'Note with <special> & "chars"';
+      const note = await createNote(libraryID, title, { withHeading: true });
+
+      assert.isNotNull(note);
+      const noteContent = note!.getNote();
+      assert.include(noteContent, "<h1>");
+      assert.include(noteContent, "&lt;special&gt;");
+      assert.include(noteContent, "&amp;");
+      assert.include(noteContent, "&quot;");
+      assert.equal(note!.getNoteTitle(), title);
+
+      createdNotes.push(note!);
+    });
+
     it("should trim whitespace from title", async function () {
       const libraryID = Zotero.Libraries.userLibraryID;
       const note = await createNote(libraryID, "  Trimmed Title  ");

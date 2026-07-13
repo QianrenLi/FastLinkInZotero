@@ -365,7 +365,11 @@ export class NoteLinkAutocomplete {
       }
     } else if (searchQuery.trim()) {
       const libraryID = sourceNote?.libraryID || Zotero.Libraries.userLibraryID;
-      const newNote = await createNote(libraryID, searchQuery.trim());
+      // Notes created from "[[" start with a first-level heading ("#" in the
+      // rendered note), matching the Obsidian-style convention.
+      const newNote = await createNote(libraryID, searchQuery.trim(), {
+        withHeading: true,
+      });
       if (newNote) {
         targetNoteId = newNote.id;
         linkText = searchQuery.trim();
@@ -583,14 +587,19 @@ export class NoteLinkAutocomplete {
 export async function createNote(
   libraryID: number,
   title: string,
+  options?: { withHeading?: boolean },
 ): Promise<Zotero.Item | null> {
   try {
     const newNote = new Zotero.Item("note");
     newNote.libraryID = libraryID;
-    // Use plain text so noteToTitle() extracts the title correctly.
-    // noteToTitle() finds the first line by looking for newlines after
-    // block-element closing tags - wrapping in <h1> breaks this.
-    newNote.setNote(escapeHtml(title.trim()));
+    const safeTitle = escapeHtml(title.trim());
+    // Start the note with a first-level heading when requested (used by the
+    // "[[" autocomplete flow). noteToTitle() still resolves the title
+    // correctly: it appends a newline after block-element closing tags (the
+    // regex covers <h1>..<h6>, <p>, <div>) and unescapeHTML() strips the tags,
+    // so the first line is the plain title text.
+    const content = options?.withHeading ? `<h1>${safeTitle}</h1>` : safeTitle;
+    newNote.setNote(content);
     await newNote.saveTx();
     Zotero.debug(`[FastLink] Created note id=${newNote.id}, title="${title}"`);
 
