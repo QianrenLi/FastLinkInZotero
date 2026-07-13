@@ -1,5 +1,4 @@
 // src/modules/popup-controller.ts
-import { debounce } from "../utils/debounce";
 import { escapeHtml, escapeRegex } from "../utils/html";
 
 export interface PopupItem {
@@ -36,16 +35,12 @@ export class PopupController {
     searchQuery: string,
   ) => void;
   private onClose: () => void;
-  private debouncedFilter: (query: string) => void;
   private clickHandler: ((e: Event) => void) | null = null;
   private _clickHandlerBound: ((e: Event) => void) | null = null;
 
   constructor(options: PopupOptions) {
     this.onSelection = options.onSelection;
     this.onClose = options.onClose;
-    this.debouncedFilter = debounce((query: string) => {
-      this.render();
-    }, 150);
 
     // Create click handler once, reuse across renders
     this._clickHandlerBound = (e: Event): void => {
@@ -105,15 +100,32 @@ export class PopupController {
     }
   }
 
+  /**
+   * Replace the result list and re-render in a single pass. This is the only
+   * method that should run during typing — the caller (autocomplete) debounces
+   * the search that feeds it, so each visible update is one render with the
+   * correct query already applied.
+   */
+  setSearchResults(items: PopupItem[], query: string): void {
+    this.currentQuery = query;
+    this.items = items;
+    this.selectedIndex = 0;
+    this.render();
+  }
+
   setItems(items: PopupItem[]): void {
     this.items = items;
     this.selectedIndex = 0;
     this.render();
   }
 
+  /**
+   * Update the tracked query cheaply without re-rendering. Kept so query-driven
+   * logic (hasCreateOption, selectCurrent) stays in sync the instant a key is
+   * pressed, before the debounced search/render catches up.
+   */
   updateQuery(query: string): void {
     this.currentQuery = query;
-    this.debouncedFilter(query);
   }
 
   handleKeyDown(event: KeyboardEvent): boolean {

@@ -9,6 +9,7 @@ import {
   setCachedEditorWindow,
 } from "../utils/editor-detector";
 import { escapeHtml } from "../utils/html";
+import { debounce, type DebouncedFunction } from "../utils/debounce";
 
 export class NoteLinkAutocomplete {
   private searchService: NoteSearchService;
@@ -38,12 +39,30 @@ export class NoteLinkAutocomplete {
   private _iframeObserver: MutationObserver | null = null;
   private _cacheRebuildTimer: ReturnType<typeof setTimeout> | null = null;
 
+  /**
+   * Debounced search+render. Coalesces rapid keystrokes into a single cache
+   * scan and popup render so typing stays responsive. The pending call is
+   * flushed immediately when the user navigates (arrows/Enter/Tab) so selects
+   * always act on results for the latest query.
+   */
+  private _debouncedSearch: DebouncedFunction<(query: string) => void>;
+
   private static readonly DOUBLE_KEY_TIMEOUT = 500;
   private static readonly POPUP_Y_OFFSET = 20;
+  private static readonly SEARCH_DEBOUNCE_MS = 60;
+  private static readonly NAV_KEYS = new Set([
+    "ArrowDown",
+    "ArrowUp",
+    "Enter",
+    "Tab",
+  ]);
 
   constructor(searchService: NoteSearchService, linkInserter: LinkInserter) {
     this.searchService = searchService;
     this.linkInserter = linkInserter;
+    this._debouncedSearch = debounce((query: string) => {
+      this.runSearch(query);
+    }, NoteLinkAutocomplete.SEARCH_DEBOUNCE_MS);
   }
 
   async initialize(): Promise<void> {
@@ -171,6 +190,12 @@ export class NoteLinkAutocomplete {
 
       // Handle popup navigation
       if (this.popupController?.isVisible()) {
+        // Make sure the list reflects the latest query before the user
+        // navigates/selects — otherwise a fast type-then-Enter could select
+        // against stale results.
+        if (NoteLinkAutocomplete.NAV_KEYS.has(keyEvent.key)) {
+          this._debouncedSearch.flush();
+        }
         if (this.popupController.handleKeyDown(keyEvent)) {
           event.stopPropagation();
           event.preventDefault();
@@ -216,14 +241,15 @@ export class NoteLinkAutocomplete {
 
     // If autocomplete is active, update query and search results
     if (this.isActive && this.popupController?.isVisible()) {
+      // Keep the saved selection fresh on every keystroke so link insertion
+      // later targets the right caret position. This is cheap (a cloned
+      // Range) and must stay synchronous.
       this.linkInserter.saveSelection(
         target.ownerDocument?.defaultView || null,
       );
       const query = this.getQueryText();
       if (query !== null) {
-        const results = this.searchService.search(query);
-        this.popupController.setItems(this.mapResultsToPopupItems(results));
-        this.popupController.updateQuery(query);
+        this.scheduleSearch(query);
       }
       return;
     }
@@ -248,6 +274,25 @@ export class NoteLinkAutocomplete {
     }
   }
 
+  /**
+   * Track the latest query synchronously (cheap — keeps the Create-option and
+   * selection logic correct instantly) and schedule one debounced search+render
+   * so a burst of keystrokes collapses into a single cache scan.
+   */
+  private scheduleSearch(query: string): void {
+    this.popupController?.updateQuery(query);
+    this._debouncedSearch(query);
+  }
+
+  private runSearch(query: string): void {
+    if (!this.popupController?.isVisible()) return;
+    const results = this.searchService.search(query);
+    this.popupController.setSearchResults(
+      this.mapResultsToPopupItems(results),
+      query,
+    );
+  }
+
   private triggerAutocomplete(): void {
     this.isActive = true;
 
@@ -262,11 +307,18 @@ export class NoteLinkAutocomplete {
 
     const position = this.getCursorPosition();
     if (position) {
-      const results = this.searchService.search("");
-      this.popupController.setItems(this.mapResultsToPopupItems(results));
+      // Show first so the popup element + inner container exist, then render
+      // results into it. Rendering before the first show() would no-op (the
+      // container is created lazily inside show()) and leave the popup empty
+      // on the first trigger of a session.
       this.popupController.show(
         position.x,
         position.y + NoteLinkAutocomplete.POPUP_Y_OFFSET,
+      );
+      const results = this.searchService.search("");
+      this.popupController.setSearchResults(
+        this.mapResultsToPopupItems(results),
+        "",
       );
     } else {
       Zotero.debug(
@@ -343,9 +395,11 @@ export class NoteLinkAutocomplete {
 
   private handleClose(): void {
     this.isActive = false;
+    this._debouncedSearch.cancel();
   }
 
   private closePopup(): void {
+    this._debouncedSearch.cancel();
     this.popupController?.hide();
     this.isActive = false;
   }
@@ -477,6 +531,8 @@ export class NoteLinkAutocomplete {
   }
 
   destroy(): void {
+    this._debouncedSearch.cancel();
+
     if (this._notifierID) {
       Zotero.Notifier.unregisterObserver(this._notifierID);
     }

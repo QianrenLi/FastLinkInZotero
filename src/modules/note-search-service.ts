@@ -75,42 +75,62 @@ export class NoteSearchService {
     }
   }
 
-  search(query: string): SearchResult[] {
+  /**
+   * Search cached notes by title. Results are ranked exact > prefix > contains,
+   * and within each bucket by recency then title length.
+   *
+   * Performance: matches are bucketed by type so the (often large) `contains`
+   * bucket only gets sorted when the higher-priority buckets can't fill the
+   * limit — this is the hot path called on every keystroke while typing.
+   */
+  search(query: string, limit = 10): SearchResult[] {
     if (!NoteSearchService.cacheBuilt) return [];
 
     const searchTerm = query.trim().toLowerCase();
-    if (!searchTerm) return this.getRecentNotes(10);
+    if (!searchTerm) return this.getRecentNotes(limit);
 
-    const results: SearchResult[] = [];
+    const exact: SearchResult[] = [];
+    const prefix: SearchResult[] = [];
+    const contains: SearchResult[] = [];
+
     for (const note of NoteSearchService.cache.values()) {
-      if (note.lowerTitle === searchTerm) {
-        results.push({ note, matchType: "exact" });
-      } else if (note.lowerTitle.startsWith(searchTerm)) {
-        results.push({ note, matchType: "prefix" });
-      } else if (note.lowerTitle.includes(searchTerm)) {
-        results.push({ note, matchType: "contains" });
+      const lt = note.lowerTitle;
+      if (lt === searchTerm) {
+        exact.push({ note, matchType: "exact" });
+      } else if (lt.startsWith(searchTerm)) {
+        prefix.push({ note, matchType: "prefix" });
+      } else if (lt.includes(searchTerm)) {
+        contains.push({ note, matchType: "contains" });
       }
     }
 
-    return this.rankResults(results);
+    const sortByRank = (a: SearchResult, b: SearchResult): number => {
+      const dateDiff = b.note.dateAdded.getTime() - a.note.dateAdded.getTime();
+      if (dateDiff !== 0) return dateDiff;
+      return a.note.title.length - b.note.title.length;
+    };
+
+    exact.sort(sortByRank);
+    prefix.sort(sortByRank);
+
+    // Concatenating buckets in priority order yields the same ordering as a
+    // global sort by (matchType, date, length).
+    const ranked = [...exact, ...prefix];
+
+    // Only pay for sorting the contains bucket if we actually need it to fill
+    // the visible list — the common case is that exact+prefix already cover it.
+    if (ranked.length < limit) {
+      contains.sort(sortByRank);
+      ranked.push(...contains);
+    }
+
+    return ranked.slice(0, limit);
   }
 
   private getRecentNotes(limit: number): SearchResult[] {
     return NoteSearchService.recentNotes
       .slice(0, limit)
       .map((note) => ({ note, matchType: "exact" as const }));
-  }
-
-  private rankResults(results: SearchResult[]): SearchResult[] {
-    const matchTypeOrder = { exact: 0, prefix: 1, contains: 2 };
-    return results.sort((a, b) => {
-      const typeDiff =
-        matchTypeOrder[a.matchType] - matchTypeOrder[b.matchType];
-      if (typeDiff !== 0) return typeDiff;
-      const dateDiff = b.note.dateAdded.getTime() - a.note.dateAdded.getTime();
-      if (dateDiff !== 0) return dateDiff;
-      return a.note.title.length - b.note.title.length;
-    });
   }
 
   getNote(id: number): NoteInfo | undefined {
