@@ -37,6 +37,9 @@ export class PopupController {
   private onClose: () => void;
   private clickHandler: ((e: Event) => void) | null = null;
   private _clickHandlerBound: ((e: Event) => void) | null = null;
+  // Reused highlight regex — avoids recompiling per item per render.
+  private _hlQuery = "";
+  private _hlRegex: RegExp | null = null;
 
   constructor(options: PopupOptions) {
     this.onSelection = options.onSelection;
@@ -321,11 +324,23 @@ export class PopupController {
     const escapedTitle = escapeHtml(title);
     if (!query.trim()) return escapedTitle;
 
-    const escapedQuery = escapeHtml(query);
-    const regex = new RegExp(`(${escapeRegex(escapedQuery)})`, "gi");
+    const regex = this.getHighlightRegex(query);
     return escapedTitle.replace(
       regex,
       '<span style="font-weight:bold;color:#1a73e8;">$1</span>',
     );
+  }
+
+  /**
+   * Compile (or reuse) the highlight regex for the current query. The query is
+   * constant across all items in a single render, so we cache it and only
+   * recompile when it changes.
+   */
+  private getHighlightRegex(query: string): RegExp {
+    if (this._hlQuery === query && this._hlRegex) return this._hlRegex;
+    const escapedQuery = escapeHtml(query);
+    this._hlQuery = query;
+    this._hlRegex = new RegExp(`(${escapeRegex(escapedQuery)})`, "gi");
+    return this._hlRegex;
   }
 }

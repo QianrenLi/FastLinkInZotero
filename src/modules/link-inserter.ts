@@ -9,6 +9,10 @@ export interface LinkInsertOptions {
   triggerText?: string; // raw query text between [[ and cursor
   liveHtml?: string;
   sourceNoteId?: number; // ID of the note being edited (avoids re-querying getCurrentNote)
+  // Verify the link persisted after saveTx and retry if a concurrent editor
+  // autosave overwrote it. Only the create flow is exposed to that race, so
+  // the reuse path sets this false to skip the extra read. Defaults true.
+  verifyPersisted?: boolean;
 }
 
 export class LinkInserter {
@@ -184,20 +188,22 @@ export class LinkInserter {
         currentNote.setNote(cleanedHtml);
         await currentNote.saveTx();
 
-        // Verify the save persisted — the editor auto-save triggered by
-        // createNote can race with our saveTx and overwrite the link.
-        // If the link is missing, re-apply on the fresh DB state.
-        const fresh = await Zotero.Items.getAsync(currentNote.id);
-        if (fresh && !fresh.getNote().includes(linkUri)) {
-          Zotero.debug("[FastLink] Retrying link insertion on fresh state");
-          const freshHtml = fresh.getNote();
-          const retryTrigger = triggerText ? `[[${triggerText}` : "";
-          const retriedHtml = retryTrigger
-            ? this.replaceInHtml(freshHtml, retryTrigger, linkHtml)
-            : null;
-          if (retriedHtml) {
-            fresh.setNote(retriedHtml);
-            await fresh.saveTx();
+        // Verify the save persisted only when a concurrent editor autosave
+        // could have raced us (the create flow). The reuse path has no such
+        // race, so it opts out via verifyPersisted: false and skips this read.
+        if (options.verifyPersisted !== false) {
+          const fresh = await Zotero.Items.getAsync(currentNote.id);
+          if (fresh && !fresh.getNote().includes(linkUri)) {
+            Zotero.debug("[FastLink] Retrying link insertion on fresh state");
+            const freshHtml = fresh.getNote();
+            const retryTrigger = triggerText ? `[[${triggerText}` : "";
+            const retriedHtml = retryTrigger
+              ? this.replaceInHtml(freshHtml, retryTrigger, linkHtml)
+              : null;
+            if (retriedHtml) {
+              fresh.setNote(retriedHtml);
+              await fresh.saveTx();
+            }
           }
         }
 

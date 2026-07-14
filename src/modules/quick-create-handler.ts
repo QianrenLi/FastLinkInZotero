@@ -61,6 +61,8 @@ export class QuickCreateHandler {
         noteId: targetNote.id,
         noteTitle: result.title,
         sourceNoteId: currentNote?.id,
+        // Only the freshly-created path is exposed to the editor-autosave race.
+        verifyPersisted: !isReused,
       });
 
       if (!inserted) {

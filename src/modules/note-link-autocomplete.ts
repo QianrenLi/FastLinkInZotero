@@ -37,7 +37,8 @@ export class NoteLinkAutocomplete {
     | ((this: Document, ev: DocumentEventMap["input"]) => void)
     | null = null;
   private _iframeObserver: MutationObserver | null = null;
-  private _cacheRebuildTimer: ReturnType<typeof setTimeout> | null = null;
+  private _cacheUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+  private _pendingItemIds = new Set<number>();
 
   /**
    * Debounced search+render. Coalesces rapid keystrokes into a single cache
@@ -50,6 +51,7 @@ export class NoteLinkAutocomplete {
   private static readonly DOUBLE_KEY_TIMEOUT = 500;
   private static readonly POPUP_Y_OFFSET = 20;
   private static readonly SEARCH_DEBOUNCE_MS = 60;
+  private static readonly QUERY_BACK_BUDGET = 512;
   private static readonly NAV_KEYS = new Set([
     "ArrowDown",
     "ArrowUp",
@@ -75,28 +77,38 @@ export class NoteLinkAutocomplete {
   private registerNotifyListeners(): void {
     const notifierID = Zotero.Notifier.registerObserver(
       {
-        notify: async (event: string, type: string) => {
+        notify: async (
+          event: string,
+          type: string,
+          ids: Array<string | number>,
+        ) => {
           if (type !== "item") return;
-          for (const op of event.split(",")) {
-            if (
-              op === "add" ||
-              op === "modify" ||
-              op === "delete" ||
-              op === "trash"
-            ) {
-              if (this._cacheRebuildTimer)
-                clearTimeout(this._cacheRebuildTimer);
-              this._cacheRebuildTimer = setTimeout(
-                async () => {
-                  this.searchService.clearCache();
-                  await this.searchService.buildCache();
-                  this._cacheRebuildTimer = null;
-                },
-                this.isActive ? 2000 : 500,
-              );
-              break;
-            }
-          }
+          const relevant = event
+            .split(",")
+            .some(
+              (op) =>
+                op === "add" ||
+                op === "modify" ||
+                op === "delete" ||
+                op === "trash",
+            );
+          if (!relevant) return;
+
+          // Batch the changed ids and reconcile them incrementally instead of
+          // rebuilding the whole cache. Coalescing within the debounce window
+          // means a burst of autosave notifies collapses into one small update.
+          for (const id of ids) this._pendingItemIds.add(Number(id));
+
+          if (this._cacheUpdateTimer) clearTimeout(this._cacheUpdateTimer);
+          this._cacheUpdateTimer = setTimeout(
+            async () => {
+              const pending = Array.from(this._pendingItemIds);
+              this._pendingItemIds.clear();
+              this._cacheUpdateTimer = null;
+              await this.searchService.updateItems(pending);
+            },
+            this.isActive ? 2000 : 500,
+          );
         },
       },
       ["item"],
@@ -254,7 +266,12 @@ export class NoteLinkAutocomplete {
       return;
     }
 
-    // Backup detection: Check for [[ in the text content
+    // Backup detection for "[[" arriving without two bracket keydowns (paste,
+    // some IME paths). Only pay for the selection/range work when the inserted
+    // text actually contains a "[", so ordinary typing in a note is free here.
+    const data = (event as InputEvent).data;
+    if (!data || !data.includes("[")) return;
+
     try {
       const doc = target.ownerDocument;
       if (!doc) return;
@@ -380,6 +397,11 @@ export class NoteLinkAutocomplete {
       // side column, which auto-saves the source note to the DB.
       // Without this delay, our insertLink saveTx races with the
       // editor auto-save, and the last writer wins — overwriting the link.
+      // NOTE: the restore must be a SINGLE editor.item set AFTER Zotero has
+      // finished switching to the new note. Re-asserting in a poll fights the
+      // editor re-init (and Better Notes' re-patch on every switch) and never
+      // stabilizes — see git history. The 300ms delay + slower two-save
+      // createNote put this set safely past the switch churn.
       if (sourceNoteId) {
         await new Promise((resolve) => setTimeout(resolve, 300));
         this.restoreEditorToNote(sourceNoteId);
@@ -489,7 +511,20 @@ export class NoteLinkAutocomplete {
 
       const range = selection.getRangeAt(0);
       const prefixRange = range.cloneRange();
-      prefixRange.selectNodeContents(body);
+      // Bound how far back we read: the query between "[[" and the caret is
+      // short, so a small window is enough and we avoid serializing the whole
+      // note body on every keystroke. Fall back to the whole body if bounding
+      // fails for any reason (correctness matches the old behavior).
+      try {
+        const startNode = this.findBoundedRangeStart(
+          range.startContainer,
+          body,
+          NoteLinkAutocomplete.QUERY_BACK_BUDGET,
+        );
+        prefixRange.setStart(startNode, 0);
+      } catch {
+        prefixRange.selectNodeContents(body);
+      }
       prefixRange.setEnd(range.endContainer, range.endOffset);
 
       const textBeforeCaret = prefixRange.toString();
@@ -505,6 +540,33 @@ export class NoteLinkAutocomplete {
     }
   }
 
+  /**
+   * Find the text node to start the query range at, by walking backward from
+   * the caret and accumulating text length up to `budget` chars. Returns a
+   * node whose offset 0 marks the start of the bounded window. If there are
+   * fewer than `budget` chars of text before the caret, returns the earliest
+   * reachable text node (or the caret container if there is none).
+   */
+  private findBoundedRangeStart(
+    caretContainer: Node,
+    body: HTMLElement,
+    budget: number,
+  ): Node {
+    const doc = body.ownerDocument!;
+    const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    walker.currentNode = caretContainer;
+
+    let collected = 0;
+    let earliest: Node = caretContainer;
+    let prev = walker.previousNode() as Text | null;
+    while (prev && collected < budget) {
+      collected += prev.length;
+      earliest = prev;
+      prev = walker.previousNode() as Text | null;
+    }
+    return earliest;
+  }
+
   private mapResultsToPopupItems(results: SearchResult[]): PopupItem[] {
     return results.slice(0, 10).map((result) => ({
       noteId: result.note.id,
@@ -513,6 +575,16 @@ export class NoteLinkAutocomplete {
     }));
   }
 
+  /**
+   * Switch the side-column editor back to the source note with a SINGLE
+   * `editor.item` set, called only after a delay that lets Zotero finish
+   * switching to (and re-initializing the editor for) the newly created note.
+   *
+   * Why one set and not a poll: the `editor.item` setter re-initializes the
+   * editor, and Better Notes re-patches it on every switch — so repeated
+   * re-asserts during the switch churn fight each other and never stabilize.
+   * A single set landing AFTER the churn is what sticks.
+   */
   private restoreEditorToNote(noteId: number): void {
     try {
       const win = Zotero.getMainWindow();
@@ -572,10 +644,11 @@ export class NoteLinkAutocomplete {
     this._iframeObserver?.disconnect();
     this._iframeObserver = null;
 
-    if (this._cacheRebuildTimer) {
-      clearTimeout(this._cacheRebuildTimer);
-      this._cacheRebuildTimer = null;
+    if (this._cacheUpdateTimer) {
+      clearTimeout(this._cacheUpdateTimer);
+      this._cacheUpdateTimer = null;
     }
+    this._pendingItemIds.clear();
 
     this.popupController?.destroy();
   }

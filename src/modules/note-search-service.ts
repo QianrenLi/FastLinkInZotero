@@ -4,6 +4,7 @@ export interface NoteInfo {
   lowerTitle: string; // pre-lowered for efficient search
   libraryID: number;
   dateAdded: Date;
+  dateAddedMs: number; // numeric timestamp for cheap comparison
 }
 
 export interface SearchResult {
@@ -14,6 +15,7 @@ export interface SearchResult {
 export class NoteSearchService {
   private static cache: Map<number, NoteInfo> = new Map();
   private static recentNotes: NoteInfo[] = []; // pre-sorted by date
+  private static recentNotesDirty = false; // recentNotes needs recompute
   private static cacheBuilt = false;
   private static buildPromise: Promise<void> | null = null;
 
@@ -42,29 +44,15 @@ export class NoteSearchService {
 
       NoteSearchService.cache.clear();
       for (const item of items) {
-        try {
-          if (!item?.isNote()) continue;
-          if (item.parentID) continue;
-
-          const title = item.getField("title") || "";
-          if (!title) continue;
-
-          NoteSearchService.cache.set(item.id, {
-            id: item.id,
-            title,
-            lowerTitle: title.toLowerCase(),
-            libraryID: item.libraryID,
-            dateAdded: new Date(item.dateAdded),
-          });
-        } catch {
-          // Skip items that aren't fully loaded yet
-        }
+        const info = this.buildNoteInfo(item);
+        if (info) NoteSearchService.cache.set(info.id, info);
       }
 
       // Pre-sort recent notes list
       NoteSearchService.recentNotes = Array.from(
         NoteSearchService.cache.values(),
-      ).sort((a, b) => b.dateAdded.getTime() - a.dateAdded.getTime());
+      ).sort((a, b) => b.dateAddedMs - a.dateAddedMs);
+      NoteSearchService.recentNotesDirty = false;
 
       NoteSearchService.cacheBuilt = true;
       Zotero.debug(
@@ -72,6 +60,67 @@ export class NoteSearchService {
       );
     } catch (e) {
       Zotero.debug(`[FastLink] Error building cache: ${e}`);
+    }
+  }
+
+  /**
+   * Incrementally reconcile the cache for a small set of changed item IDs,
+   * instead of rebuilding from the DB. Called from the Notifier observer on
+   * add/modify/delete/trash. `Zotero.Items.getAsync` excludes deleted/trashed
+   * items by default, so any requested id missing from the result is removed.
+   */
+  async updateItems(ids: number[]): Promise<void> {
+    if (!NoteSearchService.cacheBuilt || ids.length === 0) return;
+
+    try {
+      const items = (await Zotero.Items.getAsync(ids)) as Zotero.Item[];
+      const fetched = new Set<number>();
+      for (const item of items) {
+        fetched.add(item.id);
+        const info = this.buildNoteInfo(item);
+        if (info) {
+          NoteSearchService.cache.set(info.id, info);
+        } else {
+          // No longer cacheable (lost its title, gained a parent, etc.)
+          NoteSearchService.cache.delete(item.id);
+        }
+      }
+      // Any id we asked for that wasn't returned is gone/trashed — drop it.
+      for (const id of ids) {
+        if (!fetched.has(id)) NoteSearchService.cache.delete(id);
+      }
+      NoteSearchService.recentNotesDirty = true;
+      Zotero.debug(
+        `[FastLink] Updated ${ids.length} item(s); cache size ${NoteSearchService.cache.size}`,
+      );
+    } catch (e) {
+      Zotero.debug(`[FastLink] Error updating cache: ${e}`);
+    }
+  }
+
+  /**
+   * Map a note item to a cache entry, or null if it doesn't qualify
+   * (not a note, is a child note, has no title, or isn't fully loaded yet).
+   * Shared by the full build and incremental updates.
+   */
+  private buildNoteInfo(item: Zotero.Item): NoteInfo | null {
+    try {
+      if (!item?.isNote()) return null;
+      if (item.parentID) return null;
+      const title = item.getField("title") || "";
+      if (!title) return null;
+      const dateAdded = new Date(item.dateAdded);
+      return {
+        id: item.id,
+        title,
+        lowerTitle: title.toLowerCase(),
+        libraryID: item.libraryID,
+        dateAdded,
+        dateAddedMs: dateAdded.getTime(),
+      };
+    } catch {
+      // Skip items that aren't fully loaded yet
+      return null;
     }
   }
 
@@ -105,7 +154,7 @@ export class NoteSearchService {
     }
 
     const sortByRank = (a: SearchResult, b: SearchResult): number => {
-      const dateDiff = b.note.dateAdded.getTime() - a.note.dateAdded.getTime();
+      const dateDiff = b.note.dateAddedMs - a.note.dateAddedMs;
       if (dateDiff !== 0) return dateDiff;
       return a.note.title.length - b.note.title.length;
     };
@@ -128,6 +177,14 @@ export class NoteSearchService {
   }
 
   private getRecentNotes(limit: number): SearchResult[] {
+    // Recompute lazily — incremental updates mark this dirty rather than
+    // resorting on every notify.
+    if (NoteSearchService.recentNotesDirty) {
+      NoteSearchService.recentNotes = Array.from(
+        NoteSearchService.cache.values(),
+      ).sort((a, b) => b.dateAddedMs - a.dateAddedMs);
+      NoteSearchService.recentNotesDirty = false;
+    }
     return NoteSearchService.recentNotes
       .slice(0, limit)
       .map((note) => ({ note, matchType: "exact" as const }));
@@ -145,5 +202,6 @@ export class NoteSearchService {
     NoteSearchService.cacheBuilt = false;
     NoteSearchService.cache.clear();
     NoteSearchService.recentNotes = [];
+    NoteSearchService.recentNotesDirty = false;
   }
 }
