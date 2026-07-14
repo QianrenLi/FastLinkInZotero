@@ -26,6 +26,11 @@ const CONTAINER_STYLE =
 export class PopupController {
   private element: HTMLElement | null = null;
   private _innerContainer: HTMLElement | null = null;
+  // Chrome window whose document owns the panel. A XUL <panel> can only display
+  // over the window it belongs to, so when the active editor moves to a
+  // different window (e.g. a note opened in its own window) we must recreate
+  // the panel there.
+  private _hostWindow: Window | null = null;
   private items: PopupItem[] = [];
   private selectedIndex = 0;
   private currentQuery = "";
@@ -66,20 +71,21 @@ export class PopupController {
     };
   }
 
-  show(x: number, y: number): void {
-    if (!this.element) this.createPopup();
+  show(x: number, y: number, hostWin: Window = Zotero.getMainWindow()): void {
+    // (Re)create the panel if the host window changed, since a <panel> can
+    // only be shown over the window that owns it.
+    if (!this.element || this._hostWindow !== hostWin) {
+      this.destroy();
+      this.createPopup(hostWin);
+    }
 
     if (this.element) {
       this.selectedIndex = 0;
       try {
-        const mainWindow = Zotero.getMainWindow();
-        if (mainWindow) {
-          const clampedX = Math.min(
-            Math.max(x, 10),
-            mainWindow.innerWidth - 360,
-          );
+        if (hostWin) {
+          const clampedX = Math.min(Math.max(x, 10), hostWin.innerWidth - 360);
           (this.element as any).openPopup(
-            mainWindow.document.documentElement,
+            hostWin.document.documentElement,
             "overlap",
             clampedX,
             y,
@@ -209,16 +215,17 @@ export class PopupController {
       this.element = null;
     }
     this._innerContainer = null;
+    this._hostWindow = null;
     this.clickHandler = null;
   }
 
-  private createPopup(): void {
-    const mainWindow = Zotero.getMainWindow();
-    if (!mainWindow) throw new Error("Zotero main window not available");
-    const doc = mainWindow.document;
+  private createPopup(hostWin: Window): void {
+    if (!hostWin) throw new Error("Zotero host window not available");
+    const doc = hostWin.document;
 
     const panel = doc.createXULElement("panel") as HTMLElement;
     this.element = panel;
+    this._hostWindow = hostWin;
     panel.setAttribute("type", "arrow");
     panel.setAttribute("flip", "both");
     panel.setAttribute("rolluponmousewheel", "true");

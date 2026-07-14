@@ -3,8 +3,11 @@ import { LinkInserter } from "./link-inserter";
 import { NoteSearchService, SearchResult } from "./note-search-service";
 import { PopupController, PopupItem } from "./popup-controller";
 import {
+  getAllWindows,
   getCurrentNote,
+  getEditorContentElement,
   getEditorWindow,
+  getHostWindow,
   getIframeByWindow,
   setCachedEditorWindow,
 } from "../utils/editor-detector";
@@ -21,24 +24,46 @@ export class NoteLinkAutocomplete {
   private _triggerTarget: HTMLElement | null = null;
   private _lastEditorWindow: Window | null = null;
   private _savedCursorPos: { x: number; y: number } | null = null;
+  // Chrome window the popup should anchor in. Captured alongside the cursor
+  // position so the popup opens over the window the user is actually typing
+  // in (e.g. a note opened in its own window), not always the main window.
+  private _savedHostWindow: Window | null = null;
 
   // Event listener cleanup references
   private _notifierID: string | null = null;
-  private _editorDocument: Document | null = null;
-  private _iframeDocuments = new Set<Document>();
-  private _iframeLoadHandlers = new Map<
-    HTMLIFrameElement,
-    (event: Event) => void
-  >();
   private _keyDownHandler:
     | ((this: Document, ev: DocumentEventMap["keydown"]) => void)
     | null = null;
   private _inputHandler:
     | ((this: Document, ev: DocumentEventMap["input"]) => void)
     | null = null;
-  private _iframeObserver: MutationObserver | null = null;
   private _cacheUpdateTimer: ReturnType<typeof setTimeout> | null = null;
   private _pendingItemIds = new Set<number>();
+  // Watches for new chrome windows of ANY type. The bootstrap's
+  // onMainWindowLoad only fires for the main library window (zoteroPane.xhtml),
+  // NOT for note windows (chrome://zotero/content/note.xhtml) or Better Notes'
+  // window — so we use the window watcher to catch those and attach `[[`
+  // listeners to them.
+  private _windowWatcherListener:
+    | ((subject: any, topic: string, data: any) => void)
+    | null = null;
+
+  /**
+   * Per-window listener state. One entry per chrome window we've attached to
+   * (the main library window plus any note windows opened separately). The
+   * same keyDown/input handlers are shared across windows — they derive the
+   * editor window from the event target — but each window owns its own
+   * MutationObserver and iframe-attachment bookkeeping.
+   */
+  private _windowState = new Map<
+    Window,
+    {
+      iframeDocuments: Set<Document>;
+      iframeLoadHandlers: Map<HTMLIFrameElement, (event: Event) => void>;
+      observer: MutationObserver;
+      iframeTimer: ReturnType<typeof setTimeout> | null;
+    }
+  >();
 
   /**
    * Debounced search+render. Coalesces rapid keystrokes into a single cache
@@ -70,8 +95,57 @@ export class NoteLinkAutocomplete {
   async initialize(): Promise<void> {
     await this.searchService.buildCache();
     this.registerNotifyListeners();
-    this.registerKeyboardListener();
+
+    this._keyDownHandler = this.handleKeyDown.bind(this);
+    this._inputHandler = this.handleInput.bind(this);
+
+    // Attach to every window open at startup. Windows opened later — including
+    // notes opened in a new window — are attached by the window watcher below.
+    for (const win of getAllWindows()) {
+      this.attachToWindow(win);
+    }
+    this.registerWindowWatcher();
+
     Zotero.debug("[FastLink] Initialized");
+  }
+
+  /**
+   * Register a window-watcher notification so we attach to new chrome windows
+   * of any type — critically, note windows (note.xhtml) and Better Notes'
+   * window, which the bootstrap's onMainWindowLoad does NOT fire for. Without
+   * this, `[[` would not work in notes opened in their own window.
+   */
+  private registerWindowWatcher(): void {
+    try {
+      const ww = Services?.ww;
+      if (!ww?.registerNotification) {
+        Zotero.debug("[FastLink] Services.ww unavailable");
+        return;
+      }
+      this._windowWatcherListener = (subject: any, topic: string): void => {
+        try {
+          if (topic === "domwindowopened") {
+            const win = subject as Window;
+            const attach = (): void => {
+              if (win?.document) this.attachToWindow(win);
+            };
+            // The document may not be loaded yet when this notification fires.
+            if (win?.document?.readyState === "complete") attach();
+            else win?.addEventListener?.("load", attach, { once: true });
+          } else if (topic === "domwindowclosed") {
+            if (this._windowState.has(subject as Window)) {
+              this.detachFromWindow(subject as Window);
+            }
+          }
+        } catch (e) {
+          Zotero.debug(`[FastLink] window watcher event error: ${e}`);
+        }
+      };
+      ww.registerNotification(this._windowWatcherListener);
+      Zotero.debug("[FastLink] window watcher registered");
+    } catch (e) {
+      Zotero.debug(`[FastLink] registerWindowWatcher failed: ${e}`);
+    }
   }
 
   private registerNotifyListeners(): void {
@@ -117,63 +191,125 @@ export class NoteLinkAutocomplete {
     this._notifierID = notifierID;
   }
 
-  private registerKeyboardListener(): void {
-    this._keyDownHandler = this.handleKeyDown.bind(this);
-    this._inputHandler = this.handleInput.bind(this);
-
-    const mainWindow = Zotero.getMainWindow();
-    this._editorDocument = mainWindow.document;
-
-    this._editorDocument.addEventListener(
-      "keydown",
-      this._keyDownHandler,
-      true,
-    );
-    this._editorDocument.addEventListener("input", this._inputHandler, true);
-
-    this.attachToEditorIframes();
-
-    // Watch for new iframes with debounced callback
-    let iframeTimer: ReturnType<typeof setTimeout> | null = null;
-    const iframeObserver = new mainWindow.MutationObserver(() => {
-      if (iframeTimer) return;
-      iframeTimer = setTimeout(() => {
-        iframeTimer = null;
-        this.attachToEditorIframes();
-      }, 100);
-    });
-    iframeObserver.observe(mainWindow.document, {
-      childList: true,
-      subtree: true,
-    });
-    this._iframeObserver = iframeObserver;
-  }
-
-  private attachToEditorIframes(): void {
+  /**
+   * Attach keydown/input listeners to a chrome window and watch its document
+   * for editor iframes. Idempotent. Called for the main window at startup and
+   * for every subsequently opened window (including note windows) from the
+   * onMainWindowLoad hook — this is what makes `[[` work in a note opened in
+   * its own window.
+   */
+  attachToWindow(win: Window): void {
+    if (!win || this._windowState.has(win)) return;
     if (!this._keyDownHandler || !this._inputHandler) return;
 
-    const mainWindow = Zotero.getMainWindow();
-    const iframes = mainWindow.document.querySelectorAll("iframe");
+    const doc = win.document;
+    doc.addEventListener("keydown", this._keyDownHandler, true);
+    doc.addEventListener("input", this._inputHandler, true);
 
+    const state: {
+      iframeDocuments: Set<Document>;
+      iframeLoadHandlers: Map<HTMLIFrameElement, (event: Event) => void>;
+      observer: MutationObserver;
+      iframeTimer: ReturnType<typeof setTimeout> | null;
+    } = {
+      iframeDocuments: new Set<Document>(),
+      iframeLoadHandlers: new Map<HTMLIFrameElement, (event: Event) => void>(),
+      observer: undefined as unknown as MutationObserver,
+      iframeTimer: null,
+    };
+    this._windowState.set(win, state);
+
+    // Watch this window's document for editor iframes added later (e.g. when
+    // the note editor is lazily initialized after the window opens).
+    const observer = new win.MutationObserver(() => {
+      if (state.iframeTimer) return;
+      state.iframeTimer = setTimeout(() => {
+        state.iframeTimer = null;
+        this.attachToEditorIframes(win);
+      }, 100);
+    });
+    observer.observe(doc, { childList: true, subtree: true });
+    state.observer = observer;
+
+    this.attachToEditorIframes(win);
+  }
+
+  /**
+   * Detach all listeners and observers for a window. Called from
+   * onMainWindowUnload so a closed window doesn't leak handlers.
+   */
+  detachFromWindow(win: Window): void {
+    const state = this._windowState.get(win);
+    if (!state) return;
+
+    const doc = (win as Window).document;
+    if (this._keyDownHandler)
+      doc.removeEventListener("keydown", this._keyDownHandler, true);
+    if (this._inputHandler)
+      doc.removeEventListener("input", this._inputHandler, true);
+
+    for (const iframeDoc of state.iframeDocuments) {
+      if (this._keyDownHandler)
+        iframeDoc.removeEventListener("keydown", this._keyDownHandler, true);
+      if (this._inputHandler)
+        iframeDoc.removeEventListener("input", this._inputHandler, true);
+    }
+    state.iframeDocuments.clear();
+
+    for (const [iframeEl, loadHandler] of state.iframeLoadHandlers.entries()) {
+      iframeEl.removeEventListener("load", loadHandler);
+    }
+    state.iframeLoadHandlers.clear();
+
+    if (state.iframeTimer) clearTimeout(state.iframeTimer);
+    state.observer?.disconnect();
+
+    this._windowState.delete(win);
+
+    // If the popup is anchored in the window that's closing, close it.
+    if (this._savedHostWindow === win) {
+      this.closePopup();
+      this._savedHostWindow = null;
+    }
+  }
+
+  /**
+   * Read-only list of chrome windows currently attached (main window + any
+   * note windows opened separately). Exposed for tests/debugging so we can
+   * confirm `[[` listeners cover notes opened in their own window.
+   */
+  getAttachedWindows(): Window[] {
+    return Array.from(this._windowState.keys());
+  }
+
+  private attachToEditorIframes(win: Window): void {
+    if (!this._keyDownHandler || !this._inputHandler) return;
+    const state = this._windowState.get(win);
+    if (!state) return;
+
+    const iframes = win.document.querySelectorAll("iframe");
     for (const iframe of iframes) {
       try {
         const iframeEl = iframe as HTMLIFrameElement;
-        if (this._iframeLoadHandlers.has(iframeEl)) continue;
+        if (state.iframeLoadHandlers.has(iframeEl)) continue;
 
-        this.tryAttachToIframeDoc(iframeEl);
+        this.tryAttachToIframeDoc(state, iframeEl);
 
         const loadHandler = () => {
-          this.tryAttachToIframeDoc(iframeEl);
+          this.tryAttachToIframeDoc(state, iframeEl);
         };
         iframeEl.addEventListener("load", loadHandler);
-        this._iframeLoadHandlers.set(iframeEl, loadHandler);
+        state.iframeLoadHandlers.set(iframeEl, loadHandler);
       } catch {
         /* skip */
       }
     }
   }
 
-  private tryAttachToIframeDoc(iframeEl: HTMLIFrameElement): void {
+  private tryAttachToIframeDoc(
+    state: { iframeDocuments: Set<Document> },
+    iframeEl: HTMLIFrameElement,
+  ): void {
     try {
       const iframeDoc = iframeEl.contentDocument;
       if (!iframeDoc || (iframeDoc as any)._fastLinkAttached) return;
@@ -181,7 +317,7 @@ export class NoteLinkAutocomplete {
 
       iframeDoc.addEventListener("keydown", this._keyDownHandler!, true);
       iframeDoc.addEventListener("input", this._inputHandler!, true);
-      this._iframeDocuments.add(iframeDoc);
+      state.iframeDocuments.add(iframeDoc);
     } catch {
       /* cross-origin */
     }
@@ -313,7 +449,7 @@ export class NoteLinkAutocomplete {
   private triggerAutocomplete(): void {
     this.isActive = true;
 
-    this.linkInserter.saveSelection();
+    this.linkInserter.saveSelection(this._lastEditorWindow);
 
     if (!this.popupController) {
       this.popupController = new PopupController({
@@ -327,10 +463,13 @@ export class NoteLinkAutocomplete {
       // Show first so the popup element + inner container exist, then render
       // results into it. Rendering before the first show() would no-op (the
       // container is created lazily inside show()) and leave the popup empty
-      // on the first trigger of a session.
+      // on the first trigger of a session. Anchor in the host window the user
+      // is typing in (captured in saveCursorPosition) so the popup appears over
+      // a note opened in its own window, not always the main window.
       this.popupController.show(
         position.x,
         position.y + NoteLinkAutocomplete.POPUP_Y_OFFSET,
+        this._savedHostWindow || Zotero.getMainWindow(),
       );
       const results = this.searchService.search("");
       this.popupController.setSearchResults(
@@ -352,11 +491,23 @@ export class NoteLinkAutocomplete {
   ): Promise<void> {
     // Capture live HTML and source note ID NOW before any async work
     // (e.g. createNote) that may change the editor to a different note.
-    const editorWin = this._lastEditorWindow || getEditorWindow();
-    const liveHtml = editorWin
-      ? String(editorWin.document.body!.innerHTML)
-      : "";
-    const sourceNote = getCurrentNote();
+    // Read only the contenteditable's innerHTML — NOT body.innerHTML, which in
+    // Zotero 9 includes the editor toolbar and would pollute the stored note.
+    // Wrapped because the editor window may have been closed mid-popup
+    // (dead wrapper); a throw here would leave the popup stuck open.
+    let liveHtml = "";
+    try {
+      const editorWin = this._lastEditorWindow || getEditorWindow();
+      const contentEl = editorWin ? getEditorContentElement(editorWin) : null;
+      liveHtml = contentEl
+        ? String(contentEl.innerHTML)
+        : editorWin
+          ? String(editorWin.document.body?.innerHTML ?? "")
+          : "";
+    } catch {
+      liveHtml = "";
+    }
+    const sourceNote = getCurrentNote(this._lastEditorWindow);
     const sourceNoteId = sourceNote?.id;
 
     if (!sourceNoteId) {
@@ -409,13 +560,42 @@ export class NoteLinkAutocomplete {
     }
 
     if (targetNoteId !== null) {
-      await this.linkInserter.insertLink({
-        noteId: targetNoteId,
-        noteTitle: linkText,
-        triggerText: searchQuery,
-        liveHtml,
-        sourceNoteId,
-      });
+      Zotero.debug(
+        `[FastLink] handleSelection sourceNoteId=${sourceNoteId} targetNoteId=${targetNoteId} query="${searchQuery}"`,
+      );
+      // Prefer inserting through the editor's own ProseMirror instance. That
+      // updates the editor's state so its autosave carries the link — avoiding
+      // the two-editor autosave fight that an external setNote/saveTx loses
+      // when the note is open in more than one editor at once. Only used for the
+      // reuse flow (selecting an existing note); the create flow may have
+      // switched the editor to a different note, so it keeps the external write.
+      let insertedViaEditor = false;
+      if (noteId !== null) {
+        const targetItem = await Zotero.Items.getAsync(targetNoteId);
+        if (targetItem) {
+          const linkHtml = `<a href="${this.linkInserter.buildLinkUri(
+            targetItem,
+          )}">${escapeHtml(linkText)}</a>`;
+          insertedViaEditor = await this.linkInserter.insertLinkViaEditor(
+            searchQuery,
+            linkHtml,
+          );
+        }
+      }
+      if (!insertedViaEditor) {
+        if (noteId !== null) {
+          Zotero.debug(
+            "[FastLink] editor insert failed; external write fallback",
+          );
+        }
+        await this.linkInserter.insertLink({
+          noteId: targetNoteId,
+          noteTitle: linkText,
+          triggerText: searchQuery,
+          liveHtml,
+          sourceNoteId,
+        });
+      }
     }
   }
 
@@ -437,14 +617,22 @@ export class NoteLinkAutocomplete {
 
       let offsetX = 0;
       let offsetY = 0;
+      let hostWin: Window = Zotero.getMainWindow();
 
-      if (editorWin !== Zotero.getMainWindow()) {
-        const match = getIframeByWindow(editorWin);
-        if (match) {
-          offsetX = match.rect.left;
-          offsetY = match.rect.top;
-        }
+      // The editor lives in an iframe; locate that iframe to translate the
+      // selection's iframe-local rect into the host window's coordinate space
+      // and to learn which chrome window the popup must anchor in.
+      const match = getIframeByWindow(editorWin);
+      if (match) {
+        offsetX = match.rect.left;
+        offsetY = match.rect.top;
+        hostWin = match.hostWindow;
+      } else {
+        // Editor not in an iframe (or iframe lookup failed): resolve the host
+        // chrome window directly so the popup still anchors in the right window.
+        hostWin = getHostWindow(editorWin) || Zotero.getMainWindow();
       }
+      this._savedHostWindow = hostWin;
 
       const selection = editorWin.getSelection();
       if (selection && selection.rangeCount > 0) {
@@ -470,6 +658,17 @@ export class NoteLinkAutocomplete {
           x: rect.left + offsetX,
           y: rect.bottom + offsetY,
         };
+        Zotero.debug(
+          `[FastLink] cursorPos editor=${
+            (editorWin as any).document?.documentURI ?? "?"
+          } iframeMatch=${!!match} host=${
+            (hostWin as any).document?.documentURI ?? "?"
+          } offset=(${Math.round(offsetX)},${Math.round(
+            offsetY,
+          )}) pos=(${Math.round(rect.left + offsetX)},${Math.round(
+            rect.bottom + offsetY,
+          )})`,
+        );
         return;
       }
 
@@ -613,36 +812,26 @@ export class NoteLinkAutocomplete {
       Zotero.Notifier.unregisterObserver(this._notifierID);
     }
 
-    if (this._editorDocument) {
-      if (this._keyDownHandler)
-        this._editorDocument.removeEventListener(
-          "keydown",
-          this._keyDownHandler,
-          true,
-        );
-      if (this._inputHandler)
-        this._editorDocument.removeEventListener(
-          "input",
-          this._inputHandler,
-          true,
-        );
+    try {
+      if (this._windowWatcherListener) {
+        Services?.ww?.unregisterNotification?.(this._windowWatcherListener);
+        this._windowWatcherListener = null;
+      }
+    } catch {
+      /* ignore */
     }
 
-    for (const iframeDoc of this._iframeDocuments) {
-      if (this._keyDownHandler)
-        iframeDoc.removeEventListener("keydown", this._keyDownHandler, true);
-      if (this._inputHandler)
-        iframeDoc.removeEventListener("input", this._inputHandler, true);
+    // Detach from every window we attached to (main + any note windows).
+    for (const win of Array.from(this._windowState.keys())) {
+      this.detachFromWindow(win);
     }
-    this._iframeDocuments.clear();
+    this._windowState.clear();
 
-    for (const [iframeEl, loadHandler] of this._iframeLoadHandlers.entries()) {
-      iframeEl.removeEventListener("load", loadHandler);
-    }
-    this._iframeLoadHandlers.clear();
-
-    this._iframeObserver?.disconnect();
-    this._iframeObserver = null;
+    // Drop the shared handlers so a window-watcher callback that fires after
+    // destroy (e.g. during dev hot-reload, where unregisterNotification may
+    // no-op) hits the guard in attachToWindow and can't re-bind listeners.
+    this._keyDownHandler = null;
+    this._inputHandler = null;
 
     if (this._cacheUpdateTimer) {
       clearTimeout(this._cacheUpdateTimer);

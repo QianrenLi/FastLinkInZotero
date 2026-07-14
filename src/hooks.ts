@@ -29,6 +29,9 @@ async function onStartup() {
       sharedLinkInserter,
     );
     await autocomplete.initialize();
+    // Expose for tests / interactive debugging (which windows have `[[`
+    // listeners attached).
+    (addon as any).autocomplete = autocomplete;
 
     quickCreate = new QuickCreateHandler(
       sharedSearchService,
@@ -73,9 +76,14 @@ function onMainWindowLoad(win: _ZoteroTypes.MainWindow): void {
   win.MozXULElement.insertFTLIfNeeded(
     `${addon.data.config.addonRef}-mainWindow.ftl`,
   );
+  // Attach autocomplete listeners to this window so `[[` works in notes opened
+  // in their own window too. attachToWindow is idempotent and a no-op before
+  // initialize() has bound the handlers (e.g. during the startup window loop).
+  autocomplete?.attachToWindow(win);
 }
 
 function onMainWindowUnload(win: Window): void {
+  autocomplete?.detachFromWindow(win);
   addon.data.ztoolkit.unregisterAll();
 }
 
@@ -84,6 +92,7 @@ function onShutdown(): void {
   quickCreate?.destroy();
   quickCreate = null;
   autocomplete = null;
+  (addon as any).autocomplete = undefined;
 
   addon.data.ztoolkit.unregisterAll();
   addon.data.alive = false;
