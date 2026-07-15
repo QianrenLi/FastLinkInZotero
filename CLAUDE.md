@@ -73,3 +73,32 @@ To find your profile path, open Zotero and go to `Edit → Preferences → Advan
 ### Enabling Debug Logging
 
 Add `fileLog()` calls to trace execution flow. The log file is written asynchronously and persists across sessions.
+
+### Testing
+
+Tests run in a Zotero instance via `zotero-plugin test`. The test in `test/startup.test.ts` verifies the plugin instance is registered. Tests wait for `Zotero.FastLink.data.initialized` before running.
+
+**Automated test procedure (follow this exactly):**
+```bash
+# 1. Kill leftover Zotero processes first
+taskkill //f //im zotero.exe 2>/dev/null
+rm -f .scaffold/test/profile/lock .scaffold/test/profile/.parentlock 2>/dev/null
+
+# 2. Run tests in background, monitoring for completion
+ZOTERO_PLUGIN_ZOTERO_BIN_PATH="/c/Users/qianrenli2/scoop/apps/zotero/current/zotero.exe" \
+  npm run test > /tmp/test_output.txt 2>&1 &
+TEST_PID=$!
+
+# 3. Monitor until "Test run completed" appears, then auto-kill Zotero
+while kill -0 $TEST_PID 2>/dev/null; do
+  if grep -q "Test run completed" /tmp/test_output.txt 2>/dev/null; then
+    sleep 2
+    taskkill //f //im zotero.exe 2>/dev/null
+    break
+  fi
+  sleep 3
+done
+
+# 4. Print results
+cat /tmp/test_output.txt
+```

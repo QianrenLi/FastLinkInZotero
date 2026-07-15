@@ -290,7 +290,7 @@ export function isInLinkElement(): boolean {
     let node = range.startContainer;
 
     while (node && node !== (editor as Window).document?.documentElement) {
-      if (node.nodeType === Node.ELEMENT_NODE) {
+      if (node.nodeType === 1 /* Node.ELEMENT_NODE */) {
         const element = node as Element;
         if (element.tagName === "A") return true;
       }

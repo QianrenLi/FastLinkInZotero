@@ -79,10 +79,32 @@ export class LinkInserter {
         );
         return false;
       }
-      inst._postMessage({ action: "insertHTML", pos: null, html: linkHtml });
+      // WORKAROUND: ProseMirror's insertHTML drops <a> tags for short
+      // link text (≤2 chars, e.g. "GG", "LL") — the selection is deleted
+      // but the parsed <a> element is silently discarded, leaving no link.
+      // Root cause unknown (likely a ProseMirror schema/parser edge case).
+      // When this happens we return false so the caller falls back to the
+      // external DB-write path (insertLink).
+      //
+      // TODO: Investigate why ProseMirror insertHTML drops short <a> tags
+      // and remove this workaround when fixed upstream.
+      const ceBefore =
+        editorWin.document.querySelector('[contenteditable="true"]')
+          ?.textContent ?? "";
+      inst._postMessage({ action: "insertHTML", html: linkHtml });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const ceAfter =
+        editorWin.document.querySelector('[contenteditable="true"]')
+          ?.textContent ?? "";
+      const minLen = ceBefore.length - fullTrigger.length;
+      const ok = ceAfter.length > minLen;
       Zotero.debug(
-        `[FastLink] insertLinkViaEditor: posted insertHTML for "${triggerText}"`,
+        `[FastLink] insertLinkViaEditor "${triggerText}" ok=${ok}`,
       );
+      if (!ok) {
+        this.clearSavedSelection();
+        return false;
+      }
       this.clearSavedSelection();
       return true;
     } catch (e) {
@@ -93,25 +115,68 @@ export class LinkInserter {
 
   /**
    * Select the literal `[[query` text that ends at the saved caret, so the
-   * editor's insertHTML(at-selection) replaces it. Only handles the common case
-   * where the trigger sits in the same text node as the caret.
+   * editor's insertHTML(at-selection) replaces it. Tries the cached saved
+   * range first; falls back to searching the editor DOM when the range is
+   * stale (e.g. after a createNote/restoreEditorToNote cycle detached its
+   * container nodes from the document).
    */
   private selectTriggerRange(editorWin: Window, fullTrigger: string): boolean {
     try {
       const sel = editorWin.getSelection();
-      if (!sel || !this._savedRange) return false;
-      const endContainer = this._savedRange.endContainer;
-      const endOffset = this._savedRange.endOffset;
-      if (endContainer.nodeType !== Node.TEXT_NODE) return false;
-      const textBefore = (endContainer.nodeValue ?? "").slice(0, endOffset);
-      if (!textBefore.endsWith(fullTrigger)) return false;
-      const startOffset = endOffset - fullTrigger.length;
-      const range = editorWin.document.createRange();
-      range.setStart(endContainer, startOffset);
-      range.setEnd(endContainer, endOffset);
-      sel.removeAllRanges();
-      sel.addRange(range);
-      return true;
+      if (!sel) return false;
+
+      // Try the cached saved range first
+      if (this._savedRange) {
+        try {
+          const ec = this._savedRange.endContainer;
+          if (ec.nodeType === 3 /* Node.TEXT_NODE */ && ec.ownerDocument === editorWin.document) {
+            const textBefore = (ec.nodeValue ?? "").slice(
+              0,
+              this._savedRange.endOffset,
+            );
+            if (textBefore.endsWith(fullTrigger)) {
+              const startOffset =
+                this._savedRange.endOffset - fullTrigger.length;
+              const range = editorWin.document.createRange();
+              range.setStart(ec, startOffset);
+              range.setEnd(ec, this._savedRange.endOffset);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              return true;
+            }
+          }
+        } catch {
+          // Stale — fall through to DOM search
+        }
+      }
+
+      // Fallback: walk text nodes backward. Used when the editor was
+      // switched away and back (CREATE flow), detaching original range nodes.
+      const ce = editorWin.document.querySelector('[contenteditable="true"]');
+      if (!ce) return false;
+      const doc = editorWin.document;
+      const walker = doc.createTreeWalker(ce, 4 /* NodeFilter.SHOW_TEXT */);
+      let lastNode: Text | null = null;
+      while (walker.nextNode()) lastNode = walker.currentNode as Text;
+      if (!lastNode) return false;
+
+      let node: Node | null = lastNode;
+      while (node) {
+        if (node.nodeType === 3 /* Node.TEXT_NODE */) {
+          const idx = (node.nodeValue ?? "").lastIndexOf(fullTrigger);
+          if (idx >= 0) {
+            const range = doc.createRange();
+            range.setStart(node, idx);
+            range.setEnd(node, idx + fullTrigger.length);
+            sel.removeAllRanges();
+            sel.addRange(range);
+            return true;
+          }
+        }
+        walker.currentNode = node;
+        node = walker.previousNode();
+      }
+      return false;
     } catch {
       return false;
     }
@@ -201,8 +266,25 @@ export class LinkInserter {
       if (triggerText !== undefined) {
         const fullTrigger = `[[${triggerText}`;
 
-        // Try pre-captured HTML first — it was captured before any async work
-        // (e.g. createNote) that may have changed the editor to a different note.
+        // Try clean HTML first (from getNote() / DB, which is the canonical
+        // note format without ProseMirror rendering artifacts like data URIs
+        // and image wrapper divs). Saving clean HTML back avoids an editor
+        // reload with "fat" live HTML that makes images render differently.
+        if (!newHtml && cleanHtml) {
+          newHtml = this.replaceInHtml(cleanHtml, fullTrigger, linkHtml);
+          usedSource = "clean";
+        }
+
+        // Log whether cleanHtml had the trigger — this tells us if autosave
+        // flushed [[query to DB before the user selected a link target.
+        if (usedSource !== "clean" && cleanHtml) {
+          Zotero.debug(
+            `[FastLink] insertLink #${seq} cleanHtml MISS (trigger="${fullTrigger}" not in DB content — autosave hasn't flushed)`,
+          );
+        }
+
+        // Fall back to live/pre-captured HTML if the trigger was not in the
+        // clean HTML (e.g. the editor autosave hadn't flushed it to DB yet).
         if (!newHtml && preCapturedHtml) {
           newHtml = this.replaceInHtml(preCapturedHtml, fullTrigger, linkHtml);
           usedSource = "live";
@@ -216,11 +298,6 @@ export class LinkInserter {
             linkHtml,
           );
           usedSource = "live";
-        }
-
-        if (!newHtml) {
-          newHtml = this.replaceInHtml(cleanHtml, fullTrigger, linkHtml);
-          usedSource = "clean";
         }
 
         if (!newHtml && markedLiveHtml) {
@@ -271,10 +348,18 @@ export class LinkInserter {
           markerToken,
         );
         // Only clean ProseMirror markup if we used live HTML as the source
-        const cleanedHtml =
+        let cleanedHtml =
           usedSource !== "clean"
             ? this.cleanProseMirrorHtml(htmlWithoutMarker)
             : htmlWithoutMarker;
+
+        // When we fell back to live HTML, image elements carry ProseMirror
+        // rendering artifacts: wrapper divs (regular-image, resized-wrapper)
+        // and data-URI src attributes. Replace them with canonical <img>
+        // tags from clean HTML to avoid the image-shrink-on-reload bug.
+        if (usedSource !== "clean" && cleanHtml) {
+          cleanedHtml = this.cleanProseMirrorImages(cleanedHtml, cleanHtml);
+        }
 
         currentNote.setNote(cleanedHtml);
         await currentNote.saveTx();
@@ -452,15 +537,120 @@ export class LinkInserter {
   }
 
   /**
-   * Strip ProseMirror-specific markup from HTML that would cause
-   * Zotero's parser to insert extra blank lines.
+   * Strip ProseMirror-specific markup from live HTML that would cause
+   * Zotero's parser to insert extra blank lines. Only targets known
+   * ProseMirror-only artefacts (trailing breaks, data-pm-slice).
+   * Does NOT strip `contenteditable` or `class` attributes — they are
+   * used on content nodes such as `<img>` where stripping them causes
+   * image rendering issues (see the image-shrink bug).
    */
   private cleanProseMirrorHtml(html: string): string {
     return html
       .replace(/<br\s+class="ProseMirror-trailingBreak"\s*\/?>/gi, "")
-      .replace(/\s+contenteditable="[^"]*"/gi, "")
-      .replace(/\s+class="ProseMirror[^"]*"/gi, "")
       .replace(/\s+data-pm-slice="[^"]*"/gi, "")
       .replace(/(<\/p>\s*){2,}/g, "</p>");
+  }
+
+  /**
+   * Replace ProseMirror-rendered image wrappers in live HTML with canonical
+   * `<img>` tags from clean HTML (DB format). ProseMirror wraps images in
+   * `<div class="regular-image" contenteditable="false">...</div>` with data
+   * URI `src` attributes, but the canonical DB format is a bare `<img>` tag
+   * with `data-attachment-key`, `width`, `height` attributes and NO `src`.
+   *
+   * We extract canonical `<img>` tags from clean HTML and replace each
+   * corresponding live-HTML wrapper (including its inner divs and img) with
+   * the canonical tag. This avoids the image-shrink bug where saving data-URI
+   * images with wrapper divs to DB causes the editor to re-render images at
+   * the wrong size.
+   */
+  private cleanProseMirrorImages(html: string, cleanHtml: string): string {
+    // Extract canonical <img> tags from clean HTML
+    const CANON_IMG = /<img\s[^>]*data-attachment-key="[^"]*"[^>]*\/?>/gi;
+    const canonImgs = cleanHtml.match(CANON_IMG);
+    if (!canonImgs || canonImgs.length === 0) return html;
+
+    let result = html;
+    // For each canonical image, find and replace ONE corresponding
+    // ProseMirror image wrapper block in the live HTML.
+    for (const canonTag of canonImgs) {
+      // Match one ProseMirror wrapper: starts with <div class="regular-image"
+      // (or similar contenteditable wrapper), contains an <img>, and
+      // ends with </div> having matching indentation.
+      // We use a simpler approach: find an <img> with data URI, then
+      // walk backward to find its outermost wrapper div.
+      const dataImgMatch = /<img\s[^>]*src="data:image\/[^"]*"[^>]*\/?>/i.exec(
+        result,
+      );
+      if (!dataImgMatch) break; // no more data-URI images
+
+      const imgPos = dataImgMatch.index;
+      const imgLen = dataImgMatch[0].length;
+
+      // Search backward from the img for <div class="regular-image" or
+      // similar contenteditable="false" wrapper.
+      const before = result.substring(0, imgPos);
+      const wrapperStartMatch = before.match(
+        /<div\s[^>]*class="[^"]*regular-image[^"]*"[^>]*>[\s\S]*$/,
+      );
+      if (!wrapperStartMatch) {
+        // Fallback: search for any <div with contenteditable="false"
+        const fallMatch = before.match(
+          /<div\s[^>]*contenteditable="false"[^>]*>[\s\S]*$/,
+        );
+        if (!fallMatch) break;
+        const startPos = fallMatch.index!;
+        // Find the matching </div> after the img
+        let depth = 1;
+        let searchPos = imgPos + imgLen;
+        while (depth > 0 && searchPos < result.length) {
+          const nextOpen = result.indexOf("<div", searchPos);
+          const nextClose = result.indexOf("</div>", searchPos);
+          if (nextClose < 0) break;
+          if (nextOpen >= 0 && nextOpen < nextClose) {
+            depth++;
+            searchPos = nextOpen + 4;
+          } else {
+            depth--;
+            if (depth === 0) {
+              // Replace the entire wrapper block with the canonical img tag
+              result =
+                result.substring(0, startPos) +
+                canonTag +
+                result.substring(nextClose + 6);
+              break;
+            }
+            searchPos = nextClose + 6;
+          }
+        }
+        continue;
+      }
+
+      const startPos = wrapperStartMatch.index!;
+      // Find the matching </div> after the img
+      let depth = 1;
+      let searchPos = imgPos + imgLen;
+      while (depth > 0 && searchPos < result.length) {
+        const nextOpen = result.indexOf("<div", searchPos);
+        const nextClose = result.indexOf("</div>", searchPos);
+        if (nextClose < 0) break;
+        if (nextOpen >= 0 && nextOpen < nextClose) {
+          depth++;
+          searchPos = nextOpen + 4;
+        } else {
+          depth--;
+          if (depth === 0) {
+            result =
+              result.substring(0, startPos) +
+              canonTag +
+              result.substring(nextClose + 6);
+            break;
+          }
+          searchPos = nextClose + 6;
+        }
+      }
+    }
+
+    return result;
   }
 }

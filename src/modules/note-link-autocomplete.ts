@@ -25,7 +25,7 @@ export class NoteLinkAutocomplete {
   private _lastEditorWindow: Window | null = null;
   private _savedCursorPos: { x: number; y: number } | null = null;
   // Chrome window the popup should anchor in. Captured alongside the cursor
-  // position so the popup opens over the window the user is actually typing
+  // position so the popup appears over the window the user is actually typing
   // in (e.g. a note opened in its own window), not always the main window.
   private _savedHostWindow: Window | null = null;
 
@@ -157,16 +157,31 @@ export class NoteLinkAutocomplete {
           ids: Array<string | number>,
         ) => {
           if (type !== "item") return;
-          const relevant = event
-            .split(",")
-            .some(
-              (op) =>
-                op === "add" ||
-                op === "modify" ||
-                op === "delete" ||
-                op === "trash",
-            );
+          const ops = event.split(",");
+          const relevant = ops.some(
+            (op) =>
+              op === "add" ||
+              op === "modify" ||
+              op === "delete" ||
+              op === "trash",
+          );
           if (!relevant) return;
+
+          // Skip modify notifications for the note currently being edited.
+          // Zotero's periodic autosave fires "modify" every few seconds while
+          // the user types — but autosave almost never changes the note title
+          // (which is what the cache tracks). Filtering it out avoids an
+          // unnecessary `getAsync` DB read on every autosave cycle.
+          if (ops.length === 1 && ops[0] === "modify") {
+            try {
+              const currentNote = getCurrentNote();
+              if (currentNote && ids.length === 1 && Number(ids[0]) === currentNote.id) {
+                return;
+              }
+            } catch {
+              /* fall through to normal processing */
+            }
+          }
 
           // Batch the changed ids and reconcile them incrementally instead of
           // rebuilding the whole cache. Coalescing within the debounce window
@@ -563,31 +578,24 @@ export class NoteLinkAutocomplete {
       Zotero.debug(
         `[FastLink] handleSelection sourceNoteId=${sourceNoteId} targetNoteId=${targetNoteId} query="${searchQuery}"`,
       );
-      // Prefer inserting through the editor's own ProseMirror instance. That
-      // updates the editor's state so its autosave carries the link — avoiding
-      // the two-editor autosave fight that an external setNote/saveTx loses
-      // when the note is open in more than one editor at once. Only used for the
-      // reuse flow (selecting an existing note); the create flow may have
-      // switched the editor to a different note, so it keeps the external write.
+
+      // Prefer inserting via ProseMirror's insertHTML (no DB write, avoids
+      // editor reload / image flash). Attempted for both REUSE and CREATE.
       let insertedViaEditor = false;
-      if (noteId !== null) {
-        const targetItem = await Zotero.Items.getAsync(targetNoteId);
-        if (targetItem) {
-          const linkHtml = `<a href="${this.linkInserter.buildLinkUri(
-            targetItem,
-          )}">${escapeHtml(linkText)}</a>`;
-          insertedViaEditor = await this.linkInserter.insertLinkViaEditor(
-            searchQuery,
-            linkHtml,
-          );
-        }
+      const targetItem = await Zotero.Items.getAsync(targetNoteId);
+      if (targetItem) {
+        const linkHtml = `<a href="${this.linkInserter.buildLinkUri(
+          targetItem,
+        )}">${escapeHtml(linkText)}</a>`;
+        insertedViaEditor = await this.linkInserter.insertLinkViaEditor(
+          searchQuery,
+          linkHtml,
+        );
       }
       if (!insertedViaEditor) {
-        if (noteId !== null) {
-          Zotero.debug(
-            "[FastLink] editor insert failed; external write fallback",
-          );
-        }
+        Zotero.debug(
+          "[FastLink] editor insert failed; external write fallback",
+        );
         await this.linkInserter.insertLink({
           noteId: targetNoteId,
           noteTitle: linkText,
@@ -643,7 +651,7 @@ export class NoteLinkAutocomplete {
         if (rect.width === 0 && rect.height === 0) {
           try {
             const marker = editorWin.document.createElement("span");
-            marker.textContent = "\u200b";
+            marker.textContent = "​";
             const insertRange = range.cloneRange();
             insertRange.collapse(true);
             insertRange.insertNode(marker);
@@ -752,7 +760,7 @@ export class NoteLinkAutocomplete {
     budget: number,
   ): Node {
     const doc = body.ownerDocument!;
-    const walker = doc.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+    const walker = doc.createTreeWalker(body, 4 /* NodeFilter.SHOW_TEXT */);
     walker.currentNode = caretContainer;
 
     let collected = 0;
@@ -783,6 +791,13 @@ export class NoteLinkAutocomplete {
    * editor, and Better Notes re-patches it on every switch — so repeated
    * re-asserts during the switch churn fight each other and never stabilize.
    * A single set landing AFTER the churn is what sticks.
+   *
+   * To avoid unnecessary ProseMirror reinitializations (which cause images
+   * to flash/shrink), we first check whether the editor is ALREADY on the
+   * source note — in which case we keep it in edit mode without touching
+   * `editor.item`. The `editor.item = item` path is only taken when the
+   * editor actually switched to a different note (e.g. Better Notes auto-opened
+   * the newly created note).
    */
   private restoreEditorToNote(noteId: number): void {
     try {
@@ -790,13 +805,21 @@ export class NoteLinkAutocomplete {
       const tabType = win.Zotero_Tabs?.selectedType;
 
       if (tabType === "reader") {
-        // Side-column editor: switch back to the source note
         const editor = win.ZoteroContextPane?.activeEditor;
         if (editor) {
-          const item = Zotero.Items.get(noteId);
-          if (item) {
+          if (editor.item?.id === noteId) {
+            // Editor is already showing the source note — just keep it
+            // in edit mode. Skipping `editor.item = item` avoids a
+            // full ProseMirror reinitialization that would cause images
+            // to flash/refresh.
             editor.mode = "edit";
-            editor.item = item;
+          } else {
+            // Editor switched away — must restore with `editor.item = item`
+            const item = Zotero.Items.get(noteId);
+            if (item) {
+              editor.mode = "edit";
+              editor.item = item;
+            }
           }
         }
       }

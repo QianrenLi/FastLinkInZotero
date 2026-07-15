@@ -79,6 +79,17 @@ export class NoteSearchService {
         fetched.add(item.id);
         const info = this.buildNoteInfo(item);
         if (info) {
+          // Skip cache write if the title hasn't changed — avoids churning
+          // the Map on every autosave cycle for notes whose content changed
+          // but whose title (first line) stayed the same.
+          const existing = NoteSearchService.cache.get(info.id);
+          if (
+            existing &&
+            existing.title === info.title &&
+            existing.libraryID === info.libraryID
+          ) {
+            continue;
+          }
           NoteSearchService.cache.set(info.id, info);
         } else {
           // No longer cacheable (lost its title, gained a parent, etc.)

@@ -74,9 +74,13 @@ describe("link-insertion", function () {
         '<p contenteditable="false" class="ProseMirror">Text<br class="ProseMirror-trailingBreak"/></p>';
       const cleaned = (inserter as any).cleanProseMirrorHtml(html);
 
-      assert.notInclude(cleaned, "contenteditable");
+      // ProseMirror-trailingBreak is stripped, but contenteditable and
+      // class="ProseMirror" are preserved — they are also used on content
+      // nodes like <img> where stripping them would cause image rendering
+      // issues (see the image-shrink-after-[[-insertion bug).
+      assert.include(cleaned, "contenteditable");
       assert.notInclude(cleaned, "ProseMirror-trailingBreak");
-      assert.notInclude(cleaned, 'class="ProseMirror"');
+      assert.include(cleaned, 'class="ProseMirror"');
       assert.include(cleaned, "Text");
     });
 
@@ -87,6 +91,7 @@ describe("link-insertion", function () {
       assert.include(cleaned, "<p>A</p>");
       assert.include(cleaned, "<p>B</p>");
     });
+
   });
 
   /**
@@ -377,6 +382,31 @@ describe("link-insertion", function () {
       assert.include(html, "Side column test");
       assert.include(html, "link");
       assert.notInclude(html, "[[topic");
+    });
+    it("should insert link for 2-character triggers (GG, LL, ll, aa, BB)", async function () {
+      const libraryID = Zotero.Libraries.userLibraryID;
+      setPref("linkMode", "better-notes");
+
+      for (const trigger of ["GG", "LL", "ll", "aa", "BB"]) {
+        const sourceNote = await createTestNote(`<p>some [[${trigger} here</p>`);
+        const targetNote = await createNote(libraryID, trigger);
+        createdNotes.push(targetNote!);
+
+        const inserter = new LinkInserter();
+        const result = await inserter.insertLink({
+          noteId: targetNote!.id,
+          noteTitle: trigger,
+          triggerText: trigger,
+          liveHtml: sourceNote.getNote(),
+          sourceNoteId: sourceNote.id,
+        });
+        assert.isTrue(result, `insertLink for "${trigger}"`);
+        const updated = await Zotero.Items.getAsync(sourceNote.id);
+        const html = updated.getNote();
+        assert.include(html, `zotero://note/u/${targetNote!.key}/`);
+        assert.include(html, `>${trigger}</a>`);
+        assert.notInclude(html, `[[${trigger}`);
+      }
     });
   });
 }); // link-insertion

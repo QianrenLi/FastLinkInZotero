@@ -1,7 +1,7 @@
 {
   "name": "fastlinkinzotero",
   "type": "module",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Obsidian-style note linking with autocomplete popup for Zotero",
   "config": {
     "addonName": "FastLinkInZotero",
