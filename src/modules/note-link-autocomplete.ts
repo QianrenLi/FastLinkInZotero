@@ -13,6 +13,10 @@ import {
 } from "../utils/editor-detector";
 import { escapeHtml } from "../utils/html";
 import { debounce, type DebouncedFunction } from "../utils/debounce";
+import {
+  getTextBeforeCaret as readTextBeforeCaret,
+  captureCursorPosition,
+} from "../utils/editor-caret";
 
 export class NoteLinkAutocomplete {
   private searchService: NoteSearchService;
@@ -599,68 +603,18 @@ export class NoteLinkAutocomplete {
   }
 
   private saveCursorPosition(): void {
-    try {
-      const editorWin = this._lastEditorWindow || getEditorWindow();
-      if (!editorWin) return;
-
-      let offsetX = 0;
-      let offsetY = 0;
-      let hostWin: Window = Zotero.getMainWindow();
-
-      // The editor lives in an iframe; locate that iframe to translate the
-      // selection's iframe-local rect into the host window's coordinate space
-      // and to learn which chrome window the popup must anchor in.
-      const match = getIframeByWindow(editorWin);
-      if (match) {
-        offsetX = match.rect.left;
-        offsetY = match.rect.top;
-        hostWin = match.hostWindow;
-      } else {
-        // Editor not in an iframe (or iframe lookup failed): resolve the host
-        // chrome window directly so the popup still anchors in the right window.
-        hostWin = getHostWindow(editorWin) || Zotero.getMainWindow();
-      }
-      this._savedHostWindow = hostWin;
-
-      const selection = editorWin.getSelection();
-      if (selection && selection.rangeCount > 0) {
-        const range = selection.getRangeAt(0);
-        let rect = range.getBoundingClientRect();
-
-        // Collapsed selections return (0,0,0,0) — use temp marker
-        if (rect.width === 0 && rect.height === 0) {
-          try {
-            const marker = editorWin.document.createElement("span");
-            marker.textContent = "​";
-            const insertRange = range.cloneRange();
-            insertRange.collapse(true);
-            insertRange.insertNode(marker);
-            rect = marker.getBoundingClientRect();
-            marker.parentNode?.removeChild(marker);
-          } catch {
-            /* ignore */
-          }
-        }
-
-        this._savedCursorPos = {
-          x: rect.left + offsetX,
-          y: rect.bottom + offsetY,
-        };
-        Zotero.debug(
-          `[FastLink] cursorPos editor=${
-            (editorWin as any).document?.documentURI ?? "?"
-          } iframeMatch=${!!match} host=${
-            (hostWin as any).document?.documentURI ?? "?"
-          } offset=(${Math.round(offsetX)},${Math.round(
-            offsetY,
-          )}) pos=(${Math.round(rect.left + offsetX)},${Math.round(
-            rect.bottom + offsetY,
-          )})`,
-        );
-        return;
-      }
-    } catch (e) {
-      Zotero.debug(`[FastLink] saveCursorPosition error: ${e}`);
+    const editorWin = this._lastEditorWindow || getEditorWindow();
+    const pos = captureCursorPosition(editorWin);
+    if (pos) {
+      this._savedCursorPos = { x: pos.x, y: pos.y };
+      this._savedHostWindow = pos.hostWindow;
+      Zotero.debug(
+        `[FastLink] cursorPos editor=${
+          (editorWin as any).document?.documentURI ?? "?"
+        } host=${
+          (pos.hostWindow as any).document?.documentURI ?? "?"
+        } pos=(${Math.round(pos.x)},${Math.round(pos.y)})`,
+      );
     }
   }
 
@@ -680,36 +634,11 @@ export class NoteLinkAutocomplete {
    * keystroke-time work cheap; falls back to the whole body if bounding fails.
    */
   private getTextBeforeCaret(): string | null {
-    try {
-      const editorWin =
-        this._lastEditorWindow ||
-        this.linkInserter.getSavedWindow() ||
-        getEditorWindow();
-      if (!editorWin) return null;
-
-      const body = editorWin.document.body;
-      if (!body) return null;
-
-      const selection = editorWin.getSelection();
-      if (!selection || selection.rangeCount === 0) return null;
-
-      const range = selection.getRangeAt(0);
-      const prefixRange = range.cloneRange();
-      try {
-        const startNode = this.findBoundedRangeStart(
-          range.startContainer,
-          body,
-          NoteLinkAutocomplete.QUERY_BACK_BUDGET,
-        );
-        prefixRange.setStart(startNode, 0);
-      } catch {
-        prefixRange.selectNodeContents(body);
-      }
-      prefixRange.setEnd(range.endContainer, range.endOffset);
-      return prefixRange.toString();
-    } catch {
-      return null;
-    }
+    const editorWin =
+      this._lastEditorWindow ||
+      this.linkInserter.getSavedWindow() ||
+      getEditorWindow();
+    return readTextBeforeCaret(editorWin, NoteLinkAutocomplete.QUERY_BACK_BUDGET);
   }
 
   private getQueryText(): string | null {
@@ -723,33 +652,6 @@ export class NoteLinkAutocomplete {
     if (/[\r\n]/.test(query)) return null;
 
     return query;
-  }
-
-  /**
-   * Find the text node to start the query range at, by walking backward from
-   * the caret and accumulating text length up to `budget` chars. Returns a
-   * node whose offset 0 marks the start of the bounded window. If there are
-   * fewer than `budget` chars of text before the caret, returns the earliest
-   * reachable text node (or the caret container if there is none).
-   */
-  private findBoundedRangeStart(
-    caretContainer: Node,
-    body: HTMLElement,
-    budget: number,
-  ): Node {
-    const doc = body.ownerDocument!;
-    const walker = doc.createTreeWalker(body, 4 /* NodeFilter.SHOW_TEXT */);
-    walker.currentNode = caretContainer;
-
-    let collected = 0;
-    let earliest: Node = caretContainer;
-    let prev = walker.previousNode() as Text | null;
-    while (prev && collected < budget) {
-      collected += prev.length;
-      earliest = prev;
-      prev = walker.previousNode() as Text | null;
-    }
-    return earliest;
   }
 
   private mapResultsToPopupItems(results: SearchResult[]): PopupItem[] {
