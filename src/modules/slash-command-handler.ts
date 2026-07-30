@@ -109,10 +109,7 @@ export class SlashCommandHandler {
 
     const state = {
       iframeDocuments: new Set<Document>(),
-      iframeLoadHandlers: new Map<
-        HTMLIFrameElement,
-        (event: Event) => void
-      >(),
+      iframeLoadHandlers: new Map<HTMLIFrameElement, (event: Event) => void>(),
       observer: undefined as unknown as MutationObserver,
       iframeTimer: null as ReturnType<typeof setTimeout> | null,
     };
@@ -316,7 +313,10 @@ export class SlashCommandHandler {
         : escapeHtml(cmd.output.value);
 
     Zotero.debug(`[FastLink] slash commit "${token}" -> ${cmd.trigger}`);
-    let ok = await this.linkInserter.insertHtmlAtTrigger(token, replacementHtml);
+    let ok = await this.linkInserter.insertHtmlAtTrigger(
+      token,
+      replacementHtml,
+    );
     if (!ok) {
       Zotero.debug("[FastLink] slash editor insert failed; DB fallback");
       ok = await this.linkInserter.insertReplacementViaDb(
