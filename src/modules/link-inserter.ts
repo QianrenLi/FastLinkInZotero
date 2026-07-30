@@ -61,6 +61,8 @@ export class LinkInserter {
    * DB write, so no editor reload. Used by both `[[` (fullTrigger="[[query") and
    * slash commands (fullTrigger="/word"). Returns false when the editor instance
    * can't be located or the range can't be selected / the insert silently no-ops.
+   * Preferred over a DB write because an external write can be clobbered when a
+   * second editor's autosave still holds the literal trigger text.
    */
   async insertHtmlAtTrigger(
     fullTrigger: string,
@@ -87,6 +89,7 @@ export class LinkInserter {
       // (e.g. short <a> tags, or HTML that doesn't match the schema). Detect a
       // no-op by comparing contenteditable text length before/after; the insert
       // must replace `fullTrigger` and add at least one char.
+      // Note: this detects an empty-result insert, not partial schema stripping.
       const ceBefore =
         editorWin.document.querySelector('[contenteditable="true"]')
           ?.textContent ?? "";
@@ -212,9 +215,15 @@ export class LinkInserter {
 
   /**
    * Lightweight DB-write fallback for slash commands: find the last occurrence
-   * of `triggerToken` (e.g. "/todo") in the LIVE editor HTML, replace it with
-   * `html`, and save. Used only when insertHtmlAtTrigger fails. Simpler than the
-   * link path — no createNote/autosave race and no image involvement.
+   * of `triggerToken` (e.g. "/todo") in the LIVE editor HTML — but only in text
+   * content, never inside a tag/attribute — replace it with `html`, clean
+   * ProseMirror markup (including image wrappers, to avoid the image-shrink
+   * bug), and save. Used only when insertHtmlAtTrigger fails. Simpler than the
+   * link path: no createNote/autosave race, but it still round-trips live HTML
+   * so image cleanup is required.
+   *
+   * `html` is treated as RAW HTML — callers must HTML-escape any caller-supplied
+   * text (the slash handler escapes `kind:"text"` outputs before calling).
    */
   async insertReplacementViaDb(
     triggerToken: string,
@@ -224,17 +233,24 @@ export class LinkInserter {
       const editorWindow = this._savedWindow || getEditorWindow();
       const contentEl = getEditorContentElement(editorWindow);
       if (!contentEl) return false;
-      const liveHtml = String(contentEl.innerHTML);
-      const idx = liveHtml.lastIndexOf(triggerToken);
-      if (idx < 0) return false;
-      const newHtml =
-        liveHtml.slice(0, idx) +
-        html +
-        liveHtml.slice(idx + triggerToken.length);
-
       const note = getCurrentNote(editorWindow);
       if (!note) return false;
-      note.setNote(this.cleanProseMirrorHtml(newHtml));
+
+      const liveHtml = String(contentEl.innerHTML);
+      const cleanHtml = note.getNote();
+      const idx = this.findLastTokenInText(liveHtml, triggerToken);
+      if (idx < 0) return false;
+      const newHtml =
+        liveHtml.slice(0, idx) + html + liveHtml.slice(idx + triggerToken.length);
+
+      let cleaned = this.cleanProseMirrorHtml(newHtml);
+      // Swap ProseMirror image wrappers (data-URI <div class="regular-image">)
+      // for canonical <img data-attachment-key> from the DB content, mirroring
+      // insertLink, so images don't shrink on reload.
+      if (cleanHtml) {
+        cleaned = this.cleanProseMirrorImages(cleaned, cleanHtml);
+      }
+      note.setNote(cleaned);
       await note.saveTx();
       this.clearSavedSelection();
       return true;
@@ -567,6 +583,27 @@ export class LinkInserter {
 
   private stripMarkerComments(html: string, markerToken: string): string {
     return html.replaceAll(`<!--${markerToken}-->`, "");
+  }
+
+  /**
+   * Find the last occurrence of `token` in `html` that lies in TEXT content
+   * (not inside a tag or attribute value). Used by the DB-write fallback so a
+   * short token like "/todo" can't accidentally match inside a URL/attribute
+   * such as <a href="https://x/todo"> and corrupt the markup. Returns the
+   * character index, or -1 if no in-text match exists.
+   */
+  private findLastTokenInText(html: string, token: string): number {
+    let from = html.length;
+    for (;;) {
+      const idx = html.lastIndexOf(token, from - 1);
+      if (idx < 0) return -1;
+      const lastOpen = html.lastIndexOf("<", idx);
+      const lastClose = html.lastIndexOf(">", idx);
+      // In text content iff the nearest preceding tag delimiter is a close '>'
+      // (or there is no tag before the match at all).
+      if (lastClose >= lastOpen) return idx;
+      from = idx; // token was inside a tag/attribute; keep scanning backward
+    }
   }
 
   /**
