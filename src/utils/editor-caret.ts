@@ -42,7 +42,8 @@ export function getTextBeforeCaret(
     }
     prefixRange.setEnd(range.endContainer, range.endOffset);
     return prefixRange.toString();
-  } catch {
+  } catch (e) {
+    Zotero.debug(`[FastLink] getTextBeforeCaret error: ${e}`);
     return null;
   }
 }
@@ -120,7 +121,8 @@ export function captureCursorPosition(
       y: rect.bottom + offsetY,
       hostWindow: hostWin,
     };
-  } catch {
+  } catch (e) {
+    Zotero.debug(`[FastLink] captureCursorPosition error: ${e}`);
     return null;
   }
 }

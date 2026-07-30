@@ -7,8 +7,6 @@ import {
   getCurrentNote,
   getEditorContentElement,
   getEditorWindow,
-  getHostWindow,
-  getIframeByWindow,
   setCachedEditorWindow,
 } from "../utils/editor-detector";
 import { escapeHtml } from "../utils/html";
