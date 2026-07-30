@@ -10,37 +10,44 @@ describe("[[ Trigger Detection", function () {
   let searchService: NoteSearchService;
   let linkInserter: LinkInserter;
 
-  function createMockKeyEvent(
-    key: string,
-    code: string,
-    target?: any,
-  ): KeyboardEvent {
+  // The main window in the test harness is a XUL document with no usable
+  // <body>/Selection, so we don't build a live editor here. Instead we feed the
+  // trigger detector controlled "text before caret" (the state at the moment an
+  // `input` event fires — AFTER the just-typed char is in the text) and assert
+  // on the trigger *decision*: does `[[` fire the popup and `[` not?
+  function fakeEditable() {
+    return {
+      isContentEditable: true,
+      ownerDocument: { defaultView: Zotero.getMainWindow() },
+    } as any;
+  }
+
+  function mockInput(target: any, data: string): InputEvent {
+    return { target, data } as any as InputEvent;
+  }
+
+  function mockKeyEvent(key: string): KeyboardEvent {
     return {
       key,
-      code,
-      target:
-        target ||
-        ({
-          isContentEditable: true,
-          ownerDocument: { defaultView: Zotero.getMainWindow() },
-          getBoundingClientRect: () => ({
-            left: 100,
-            top: 200,
-            width: 400,
-            height: 20,
-          }),
-        } as any),
+      target: fakeEditable(),
       stopPropagation() {},
       preventDefault() {},
     } as any as KeyboardEvent;
   }
 
+  // Simulate typing `data` while the detector sees `textBeforeCaret` before the
+  // caret.
+  function typeWith(textBeforeCaret: string | null, data: string): void {
+    (autocomplete as any).getTextBeforeCaret = () => textBeforeCaret;
+    (autocomplete as any).handleInput(mockInput(fakeEditable(), data));
+  }
+
   function resetState() {
-    (autocomplete as any).triggerBuffer = "";
-    (autocomplete as any).lastKeyTime = 0;
     (autocomplete as any).isActive = false;
-    (autocomplete as any)._triggerTarget = null;
+    (autocomplete as any)._lastEditorWindow = Zotero.getMainWindow();
     (autocomplete as any)._savedCursorPos = null;
+    // Drop any per-test stub so it can't leak into the next test.
+    delete (autocomplete as any).getTextBeforeCaret;
   }
 
   before(function () {
@@ -54,171 +61,68 @@ describe("[[ Trigger Detection", function () {
     searchService.clearCache();
   });
 
-  it("should trigger autocomplete on double [ keypress within timeout", function () {
+  it("should trigger when [[ is present before the caret", function () {
     resetState();
-
-    const event1 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event1);
-
-    const event2 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event2);
-
+    typeWith("[[", "[");
     assert.isTrue(
       (autocomplete as any).isActive,
-      "Autocomplete should be active after double [",
+      "Autocomplete should trigger when [[ precedes the caret",
     );
-    assert.equal(
-      (autocomplete as any).triggerBuffer,
-      "",
-      "Trigger buffer should be cleared after double [",
-    );
-
     (autocomplete as any).closePopup();
   });
 
-  it("should not trigger on single [ keypress", function () {
+  it("should NOT trigger on a single [ before the caret", function () {
     resetState();
-
-    const event = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event);
-
+    typeWith("x[", "[");
     assert.isFalse(
       (autocomplete as any).isActive,
-      "Autocomplete should not be active after single [",
-    );
-    assert.equal(
-      (autocomplete as any).triggerBuffer,
-      "[",
-      "Trigger buffer should store [",
-    );
-    assert.isAbove(
-      (autocomplete as any).lastKeyTime,
-      0,
-      "lastKeyTime should be recorded",
+      "A single [ must not trigger",
     );
   });
 
-  it("should reset trigger buffer on non-bracket key", function () {
+  it("should NOT trigger when a [ is followed by a non-bracket", function () {
     resetState();
-
-    const event1 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event1);
-
-    const event2 = createMockKeyEvent("a", "KeyA");
-    (autocomplete as any).handleKeyDown(event2);
-
-    assert.equal(
-      (autocomplete as any).triggerBuffer,
-      "",
-      "Trigger buffer should be reset on non-bracket key",
-    );
+    typeWith("x[", "a");
     assert.isFalse(
       (autocomplete as any).isActive,
-      "Autocomplete should not be active",
+      "Typing a non-bracket after [ must not trigger",
     );
   });
 
-  it("should not trigger when [ keys are too far apart (>500ms)", function (done) {
+  it("should NOT trigger when the caret is past an earlier [[", function () {
     resetState();
-
-    const event1 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event1);
-
-    setTimeout(() => {
-      const event2 = createMockKeyEvent("[", "BracketLeft");
-      (autocomplete as any).handleKeyDown(event2);
-
-      assert.isFalse(
-        (autocomplete as any).isActive,
-        "Autocomplete should not activate with slow [ presses",
-      );
-      assert.equal(
-        (autocomplete as any).triggerBuffer,
-        "[",
-        "Buffer should be [ (fresh press, not double)",
-      );
-      done();
-    }, 550);
+    // "[[" exists earlier in the line but the caret is after "cd".
+    typeWith("ab[[cd", "[");
+    assert.isFalse(
+      (autocomplete as any).isActive,
+      "Caret past an earlier [[ must not trigger",
+    );
   });
 
-  it("should ignore events on non-contentEditable targets", function () {
+  it("should ignore input events on non-contentEditable targets", function () {
     resetState();
-
-    const nonEditableTarget = {
+    const nonEditable = {
       isContentEditable: false,
       ownerDocument: { defaultView: Zotero.getMainWindow() },
     };
-
-    const event1 = createMockKeyEvent("[", "BracketLeft", nonEditableTarget);
-    (autocomplete as any).handleKeyDown(event1);
-
-    const event2 = createMockKeyEvent("[", "BracketLeft", nonEditableTarget);
-    (autocomplete as any).handleKeyDown(event2);
-
+    (autocomplete as any).getTextBeforeCaret = () => "[[";
+    (autocomplete as any).handleInput(mockInput(nonEditable, "["));
     assert.isFalse(
       (autocomplete as any).isActive,
       "Should not trigger on non-contentEditable elements",
     );
-    assert.equal(
-      (autocomplete as any).triggerBuffer,
-      "",
-      "Buffer should remain empty",
-    );
-  });
-
-  it("should store _triggerTarget on first [ press", function () {
-    resetState();
-
-    const target = {
-      isContentEditable: true,
-      ownerDocument: { defaultView: Zotero.getMainWindow() },
-    };
-
-    const event = createMockKeyEvent("[", "BracketLeft", target);
-    (autocomplete as any).handleKeyDown(event);
-
-    assert.strictEqual(
-      (autocomplete as any)._triggerTarget,
-      target,
-      "_triggerTarget should be set to the event target",
-    );
-  });
-
-  it("should detect [[ via BracketLeft code (IME compatibility)", function () {
-    resetState();
-
-    const event1 = createMockKeyEvent("Process", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event1);
-
-    const event2 = createMockKeyEvent("Process", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event2);
-
-    assert.isTrue(
-      (autocomplete as any).isActive,
-      "Should trigger on BracketLeft code even with non-[ key value",
-    );
-
-    (autocomplete as any).closePopup();
   });
 
   it("should close popup on Escape when active", function () {
     resetState();
-
-    // Trigger autocomplete
-    const event1 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event1);
-    const event2 = createMockKeyEvent("[", "BracketLeft");
-    (autocomplete as any).handleKeyDown(event2);
-
+    typeWith("[[", "[");
     assert.isTrue((autocomplete as any).isActive);
 
-    // Press Escape
-    const escapeEvent = createMockKeyEvent("Escape", "Escape");
-    (autocomplete as any).handleKeyDown(escapeEvent);
-
+    (autocomplete as any).handleKeyDown(mockKeyEvent("Escape"));
     assert.isFalse(
       (autocomplete as any).isActive,
       "Should deactivate on Escape",
     );
+    (autocomplete as any).closePopup();
   });
 });

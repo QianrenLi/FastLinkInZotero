@@ -19,9 +19,6 @@ export class NoteLinkAutocomplete {
   private popupController: PopupController | null = null;
   private linkInserter: LinkInserter;
   private isActive = false;
-  private triggerBuffer = "";
-  private lastKeyTime = 0;
-  private _triggerTarget: HTMLElement | null = null;
   private _lastEditorWindow: Window | null = null;
   private _savedCursorPos: { x: number; y: number } | null = null;
   // Chrome window the popup should anchor in. Captured alongside the cursor
@@ -73,7 +70,6 @@ export class NoteLinkAutocomplete {
    */
   private _debouncedSearch: DebouncedFunction<(query: string) => void>;
 
-  private static readonly DOUBLE_KEY_TIMEOUT = 500;
   private static readonly POPUP_Y_OFFSET = 20;
   private static readonly SEARCH_DEBOUNCE_MS = 60;
   private static readonly QUERY_BACK_BUDGET = 512;
@@ -175,7 +171,11 @@ export class NoteLinkAutocomplete {
           if (ops.length === 1 && ops[0] === "modify") {
             try {
               const currentNote = getCurrentNote();
-              if (currentNote && ids.length === 1 && Number(ids[0]) === currentNote.id) {
+              if (
+                currentNote &&
+                ids.length === 1 &&
+                Number(ids[0]) === currentNote.id
+              ) {
                 return;
               }
             } catch {
@@ -372,27 +372,10 @@ export class NoteLinkAutocomplete {
         return;
       }
 
-      // Check both key and code — IME (e.g. Chinese input) reports key="Process" instead of "["
-      const isBracket = keyEvent.key === "[" || keyEvent.code === "BracketLeft";
-      if (isBracket) {
-        const now = Date.now();
-        if (
-          now - this.lastKeyTime < NoteLinkAutocomplete.DOUBLE_KEY_TIMEOUT &&
-          this.triggerBuffer === "["
-        ) {
-          this.saveCursorPosition();
-          this.triggerAutocomplete();
-          this.triggerBuffer = "";
-          keyEvent.stopPropagation();
-        } else {
-          this._triggerTarget = target;
-          this.triggerBuffer = "[";
-          this.lastKeyTime = now;
-        }
-      } else {
-        this.triggerBuffer = "";
-        this._triggerTarget = null;
-      }
+      // The "[[" trigger is detected from the actual editor text in handleInput
+      // (after the second "[" is inserted). Reading the literal text — rather
+      // than counting "[" keydown events — guarantees a single "[" can never
+      // trigger, and is immune to IME double-events and key-repeat quirks.
     } catch (error) {
       Zotero.debug(`[FastLink] Error in handleKeyDown: ${error}`);
     }
@@ -402,14 +385,20 @@ export class NoteLinkAutocomplete {
     const target = event.target as HTMLElement;
     if (!target?.isContentEditable) return;
 
+    // Track the editor window from the input event too — a keydown may not
+    // precede it on every IME path, and trigger detection below depends on it.
+    const doc = target.ownerDocument;
+    if (doc?.defaultView) {
+      this._lastEditorWindow = doc.defaultView;
+      setCachedEditorWindow(doc.defaultView);
+    }
+
     // If autocomplete is active, update query and search results
     if (this.isActive && this.popupController?.isVisible()) {
       // Keep the saved selection fresh on every keystroke so link insertion
       // later targets the right caret position. This is cheap (a cloned
       // Range) and must stay synchronous.
-      this.linkInserter.saveSelection(
-        target.ownerDocument?.defaultView || null,
-      );
+      this.linkInserter.saveSelection(doc?.defaultView || null);
       const query = this.getQueryText();
       if (query !== null) {
         this.scheduleSearch(query);
@@ -417,28 +406,19 @@ export class NoteLinkAutocomplete {
       return;
     }
 
-    // Backup detection for "[[" arriving without two bracket keydowns (paste,
-    // some IME paths). Only pay for the selection/range work when the inserted
-    // text actually contains a "[", so ordinary typing in a note is free here.
+    // Trigger detection: fire only when "[[" is literally present just before
+    // the caret. Reading the actual editor text (instead of counting "["
+    // keydown events) means a single "[" can never trigger, and stays robust
+    // against IME double-keydown events and key-repeat quirks that previously
+    // fired the popup on a lone "[". Only pay for the range/text work when the
+    // inserted text actually contains a "[", so ordinary typing is free here.
     const data = (event as InputEvent).data;
     if (!data || !data.includes("[")) return;
 
-    try {
-      const doc = target.ownerDocument;
-      if (!doc) return;
-
-      const selection = doc.defaultView?.getSelection();
-      if (!selection || selection.rangeCount === 0) return;
-
-      const range = selection.getRangeAt(0);
-      const textContent =
-        range.startContainer.textContent?.substring(0, range.startOffset) || "";
-
-      if (textContent.endsWith("[[") && !this.isActive) {
-        this.triggerAutocomplete();
-      }
-    } catch (e) {
-      Zotero.debug(`[FastLink] Error in input handler backup detection: ${e}`);
+    const textBeforeCaret = this.getTextBeforeCaret();
+    if (textBeforeCaret?.endsWith("[[") && !this.isActive) {
+      this.saveCursorPosition();
+      this.triggerAutocomplete();
     }
   }
 
@@ -679,15 +659,6 @@ export class NoteLinkAutocomplete {
         );
         return;
       }
-
-      // Fallback: trigger target position
-      if (this._triggerTarget) {
-        const rect = this._triggerTarget.getBoundingClientRect();
-        this._savedCursorPos = {
-          x: rect.left + offsetX + 20,
-          y: rect.top + offsetY + rect.height / 2,
-        };
-      }
     } catch (e) {
       Zotero.debug(`[FastLink] saveCursorPosition error: ${e}`);
     }
@@ -702,7 +673,13 @@ export class NoteLinkAutocomplete {
     return { x: 100, y: 200 };
   }
 
-  private getQueryText(): string | null {
+  /**
+   * Bounded text immediately before the caret. Shared by trigger detection
+   * (does the text end with "[["?) and query extraction (text after "[[").
+   * Reading from a bounded window — not the whole note body — keeps
+   * keystroke-time work cheap; falls back to the whole body if bounding fails.
+   */
+  private getTextBeforeCaret(): string | null {
     try {
       const editorWin =
         this._lastEditorWindow ||
@@ -718,10 +695,6 @@ export class NoteLinkAutocomplete {
 
       const range = selection.getRangeAt(0);
       const prefixRange = range.cloneRange();
-      // Bound how far back we read: the query between "[[" and the caret is
-      // short, so a small window is enough and we avoid serializing the whole
-      // note body on every keystroke. Fall back to the whole body if bounding
-      // fails for any reason (correctness matches the old behavior).
       try {
         const startNode = this.findBoundedRangeStart(
           range.startContainer,
@@ -733,18 +706,23 @@ export class NoteLinkAutocomplete {
         prefixRange.selectNodeContents(body);
       }
       prefixRange.setEnd(range.endContainer, range.endOffset);
-
-      const textBeforeCaret = prefixRange.toString();
-      const triggerIndex = textBeforeCaret.lastIndexOf("[[");
-      if (triggerIndex < 0) return null;
-
-      const query = textBeforeCaret.slice(triggerIndex + 2);
-      if (/[\r\n]/.test(query)) return null;
-
-      return query;
+      return prefixRange.toString();
     } catch {
       return null;
     }
+  }
+
+  private getQueryText(): string | null {
+    const textBeforeCaret = this.getTextBeforeCaret();
+    if (textBeforeCaret === null) return null;
+
+    const triggerIndex = textBeforeCaret.lastIndexOf("[[");
+    if (triggerIndex < 0) return null;
+
+    const query = textBeforeCaret.slice(triggerIndex + 2);
+    if (/[\r\n]/.test(query)) return null;
+
+    return query;
   }
 
   /**
