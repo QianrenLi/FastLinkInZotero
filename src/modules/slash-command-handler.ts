@@ -16,6 +16,7 @@ import {
 import {
   captureCursorPosition,
   getTextBeforeCaret,
+  isSlashAtLineStart,
 } from "../utils/editor-caret";
 import { escapeHtml } from "../utils/html";
 
@@ -232,47 +233,59 @@ export class SlashCommandHandler {
       setCachedEditorWindow(doc.defaultView);
     }
 
-    if (this.isActive && this.popup?.isVisible()) {
-      // Keep the saved selection fresh so commit targets the right caret.
-      this.linkInserter.saveSelection(doc?.defaultView || null);
-      const token = this.getSlashToken();
-      if (token === null) {
-        // Word broken (space/punctuation) or "/" no longer at a trigger spot:
-        // abort, leave the text as-is.
-        this.closePopup();
-        return;
-      }
-      const word = token.slice(1); // strip leading "/"
-      const matches = filterByPrefix(SLASH_COMMANDS, word);
-      if (matches.length === 0) {
-        // No candidate matches the typed prefix: auto-dismiss, keep text.
-        this.closePopup();
-        return;
-      }
-      this.popup.setCommands(matches);
+    const ie = event as InputEvent;
+    const insertedSlash = !!ie.data && ie.data.includes("/");
+    const deleted =
+      ie.inputType === "deleteContentBackward" ||
+      ie.inputType === "deleteContentForward" ||
+      ie.inputType === "deleteByCut";
+    const popupOpen = this.isActive && this.popup?.isVisible();
+
+    // Re-evaluate the slash state only on inputs that could change it: a newly
+    // inserted "/", any deletion (Backspace etc.), or any keystroke while the
+    // popup is already open. Ordinary typing stays cheap.
+    if (!insertedSlash && !deleted && !popupOpen) return;
+
+    this.evaluateSlash();
+  }
+
+  /**
+   * Single source of truth for the slash popup state. Reads the current token;
+   * opens the popup when a valid `/word` appears (including re-opening after the
+   * user backspaces back to one), re-filters while open, and closes when the
+   * token is gone, broken, or unmatched. Called on "/" insertion, deletions, and
+   * keystrokes while the popup is open — so Backspace walks the token back.
+   */
+  private evaluateSlash(): void {
+    const editorWin = this._lastEditorWindow || getEditorWindow();
+
+    const token = this.getSlashToken();
+    if (token === null) {
+      // No "/" at a valid spot, or the word is broken: dismiss, keep the text.
+      if (this.isActive) this.closePopup();
+      return;
+    }
+    const word = token.slice(1); // strip leading "/"
+    const matches = filterByPrefix(SLASH_COMMANDS, word);
+    if (matches.length === 0) {
+      // No candidate matches the typed prefix: dismiss, keep the text.
+      if (this.isActive) this.closePopup();
       return;
     }
 
-    // Trigger detection: only inspect on inputs that actually inserted a "/".
-    const data = (event as InputEvent).data;
-    if (!data || !data.includes("/")) return;
-
-    const textBeforeCaret = getTextBeforeCaret(
-      this._lastEditorWindow || getEditorWindow(),
-      SlashCommandHandler.QUERY_BACK_BUDGET,
-    );
-    if (
-      textBeforeCaret &&
-      shouldTriggerSlash(textBeforeCaret) &&
-      !this.isActive
-    ) {
-      this.triggerSlash();
+    if (!this.isActive || !this.popup?.isVisible()) {
+      // Initial trigger, or re-opening after backspacing back to a match.
+      this.openSlashPopup(editorWin);
+    } else {
+      // Keep the saved selection fresh so a later commit targets the caret.
+      this.linkInserter.saveSelection(editorWin);
     }
+    this.popup?.setCommands(matches);
   }
 
-  private triggerSlash(): void {
+  private openSlashPopup(editorWin: Window | null): void {
     this.isActive = true;
-    this.linkInserter.saveSelection(this._lastEditorWindow);
+    this.linkInserter.saveSelection(editorWin);
 
     if (!this.popup) {
       this.popup = new SlashPopupController({
@@ -285,9 +298,7 @@ export class SlashCommandHandler {
       });
     }
 
-    const pos = captureCursorPosition(
-      this._lastEditorWindow || getEditorWindow(),
-    );
+    const pos = captureCursorPosition(editorWin);
     if (!pos) {
       Zotero.debug("[FastLink] slash: no cursor position, not showing popup");
       this.isActive = false;
@@ -298,7 +309,6 @@ export class SlashCommandHandler {
       pos.y + SlashCommandHandler.POPUP_Y_OFFSET,
       pos.hostWindow,
     );
-    this.popup.setCommands(filterByPrefix(SLASH_COMMANDS, ""));
   }
 
   private async commitCommand(cmd: SlashCommand): Promise<void> {
@@ -345,19 +355,23 @@ export class SlashCommandHandler {
    *  - the "/" is not at a valid trigger position (not preceded by whitespace).
    */
   private getSlashToken(): string | null {
+    const editorWin = this._lastEditorWindow || getEditorWindow();
     const text = getTextBeforeCaret(
-      this._lastEditorWindow || getEditorWindow(),
+      editorWin,
       SlashCommandHandler.QUERY_BACK_BUDGET,
     );
     if (text === null) return null;
     const idx = text.lastIndexOf("/");
     if (idx < 0) return null;
-    const beforeSlash = text.slice(0, idx);
-    if (beforeSlash.length > 0 && !/\s$/.test(beforeSlash)) return null;
     const token = text.slice(idx);
-    if (token.length === 1) return token; // just "/"
-    if (!isContinuousWord(token.slice(1))) return null;
-    return token;
+    if (token.length > 1 && !isContinuousWord(token.slice(1))) return null;
+    // Valid trigger position: "/" is preceded by whitespace (same line) or is
+    // at the start of its block (start of line). Range.toString() does not
+    // separate blocks, so isSlashAtLineStart covers "/" at a new paragraph.
+    const posOk =
+      shouldTriggerSlash(text.slice(0, idx + 1)) ||
+      isSlashAtLineStart(editorWin);
+    return posOk ? token : null;
   }
 
   destroy(): void {

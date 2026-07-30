@@ -26,10 +26,9 @@ export interface SlashCommand {
  * Built-in command registry. To add a shortcut, append an entry: a trigger that
  * is a single continuous word, plus an output (literal text or rich HTML).
  *
- * /todo and /done emit Zotero list-item HTML captured from note.getNote(): an
- * unchecked/checked todo renders as a <ul><li> bullet containing "[ ]" / "[x]"
- * (markdown-style, matching how this Zotero represents todos — not a
- * click-to-toggle widget).
+ * /todo and /done emit Zotero list-item HTML captured from note.getNote()
+ * (<ul><li>[ ]</li></ul> / [x]) — a markdown-style todo bullet, matching how
+ * this Zotero represents todos.
  */
 export const SLASH_COMMANDS: SlashCommand[] = [
   {

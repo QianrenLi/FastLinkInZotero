@@ -126,3 +126,70 @@ export function captureCursorPosition(
     return null;
   }
 }
+
+/** Block-level element tags used to find the line/block containing the caret. */
+const BLOCK_TAGS = new Set([
+  "p",
+  "div",
+  "li",
+  "h1",
+  "h2",
+  "h3",
+  "h4",
+  "h5",
+  "h6",
+  "blockquote",
+  "pre",
+  "td",
+  "th",
+  "dt",
+  "dd",
+  "section",
+  "article",
+]);
+
+function closestBlock(node: Node, doc: Document): HTMLElement | null {
+  let el: Node | null = node.nodeType === 1 ? node : node.parentElement;
+  while (el && el !== doc.body && el !== doc.documentElement) {
+    if (
+      el.nodeType === 1 &&
+      BLOCK_TAGS.has((el as HTMLElement).tagName.toLowerCase())
+    ) {
+      return el as HTMLElement;
+    }
+    el = el.parentElement;
+  }
+  return null;
+}
+
+/**
+ * True if the "/" ending at the caret is at the start of its line/block — i.e.,
+ * the text before it within its block element is empty or only whitespace.
+ *
+ * This complements a "previous character is whitespace" check (which works on
+ * the concatenated text) because `Range.toString()` does NOT insert a separator
+ * between block elements: a "/" typed at the start of a new paragraph would
+ * otherwise appear to be preceded by the previous line's last character, so the
+ * slash trigger would wrongly fail at the start of a line.
+ */
+export function isSlashAtLineStart(editorWin: Window | null): boolean {
+  if (!editorWin) return false;
+  try {
+    const sel = editorWin.getSelection();
+    if (!sel || sel.rangeCount === 0) return false;
+    const range = sel.getRangeAt(0);
+    const doc = editorWin.document;
+    const block = closestBlock(range.startContainer, doc);
+    if (!block) return false;
+    const pre = doc.createRange();
+    pre.selectNodeContents(block);
+    pre.setEnd(range.startContainer, range.endOffset);
+    const s = pre.toString();
+    const slashIdx = s.lastIndexOf("/");
+    if (slashIdx < 0) return false;
+    return s.slice(0, slashIdx).trim() === "";
+  } catch (e) {
+    Zotero.debug(`[FastLink] isSlashAtLineStart error: ${e}`);
+    return false;
+  }
+}
