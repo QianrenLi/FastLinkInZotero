@@ -26,19 +26,28 @@ export interface SlashCommand {
  * Built-in command registry. To add a shortcut, append an entry: a trigger that
  * is a single continuous word, plus an output (literal text or rich HTML).
  *
- * v1 ships literal markdown text so the pipeline is testable with no HTML-schema
- * uncertainty. Task 7 upgrades /todo and /done to real Zotero checkboxes.
+ * /todo and /done emit Zotero list-item HTML captured from note.getNote(): an
+ * unchecked/checked todo renders as a <ul><li> bullet containing "[ ]" / "[x]"
+ * (markdown-style, matching how this Zotero represents todos — not a
+ * click-to-toggle widget).
  */
 export const SLASH_COMMANDS: SlashCommand[] = [
   {
     trigger: "todo",
     description: "Insert todo item",
-    output: { kind: "text", value: "- [ ] " },
+    output: {
+      kind: "html",
+      // Captured from note.getNote() — a Zotero todo list item.
+      value: "<ul><li>[ ]</li></ul>",
+    },
   },
   {
     trigger: "done",
     description: "Insert checked todo item",
-    output: { kind: "text", value: "- [x] " },
+    output: {
+      kind: "html",
+      value: "<ul><li>[x]</li></ul>",
+    },
   },
 ];
 
