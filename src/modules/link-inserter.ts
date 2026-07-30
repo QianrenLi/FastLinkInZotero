@@ -241,7 +241,9 @@ export class LinkInserter {
       const idx = this.findLastTokenInText(liveHtml, triggerToken);
       if (idx < 0) return false;
       const newHtml =
-        liveHtml.slice(0, idx) + html + liveHtml.slice(idx + triggerToken.length);
+        liveHtml.slice(0, idx) +
+        html +
+        liveHtml.slice(idx + triggerToken.length);
 
       let cleaned = this.cleanProseMirrorHtml(newHtml);
       // Swap ProseMirror image wrappers (data-URI <div class="regular-image">)
