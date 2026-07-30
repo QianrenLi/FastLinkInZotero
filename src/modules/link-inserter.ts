@@ -44,22 +44,27 @@ export class LinkInserter {
   }
 
   /**
-   * Insert a link by driving the note editor's own ProseMirror instance via its
-   * `insertHTML` message — NOT via an external setNote/saveTx.
-   *
-   * Why: when a note is open in two editors at once (e.g. the main window's
-   * item pane AND a separate note window), an external DB write gets clobbered
-   * by the editor you're typing in, which still holds the literal `[[query` and
-   * autosaves it back over the link (the two-editor fight). Inserting through
-   * the editor updates its own state, so its autosave carries the link and the
-   * fight can't happen.
-   *
-   * Returns false when the editor instance can't be located or the `[[query`
-   * range can't be selected; callers fall back to the external-write path.
+   * Insert `linkHtml` by replacing the literal `[[${triggerText}` range at the
+   * saved caret, via the editor's ProseMirror insertHTML. Delegates to the
+   * shared trigger-range inserter.
    */
   async insertLinkViaEditor(
     triggerText: string,
     linkHtml: string,
+  ): Promise<boolean> {
+    return this.insertHtmlAtTrigger(`[[${triggerText}`, linkHtml);
+  }
+
+  /**
+   * Insert `html` by selecting the literal `fullTrigger` range ending at the
+   * saved caret and replacing it via the editor's ProseMirror insertHTML — no
+   * DB write, so no editor reload. Used by both `[[` (fullTrigger="[[query") and
+   * slash commands (fullTrigger="/word"). Returns false when the editor instance
+   * can't be located or the range can't be selected / the insert silently no-ops.
+   */
+  async insertHtmlAtTrigger(
+    fullTrigger: string,
+    html: string,
   ): Promise<boolean> {
     const editorWin = this._savedWindow;
     if (!editorWin || !this._savedRange) return false;
@@ -68,39 +73,30 @@ export class LinkInserter {
       const inst = instances.find((e: any) => e?._iframeWindow === editorWin);
       if (!inst?._postMessage) {
         Zotero.debug(
-          "[FastLink] insertLinkViaEditor: no matching EditorInstance",
+          "[FastLink] insertHtmlAtTrigger: no matching EditorInstance",
         );
         return false;
       }
-      const fullTrigger = `[[${triggerText}`;
       if (!this.selectTriggerRange(editorWin, fullTrigger)) {
         Zotero.debug(
-          `[FastLink] insertLinkViaEditor: could not select "${fullTrigger}"`,
+          `[FastLink] insertHtmlAtTrigger: could not select "${fullTrigger}"`,
         );
         return false;
       }
-      // WORKAROUND: ProseMirror's insertHTML drops <a> tags for short
-      // link text (≤2 chars, e.g. "GG", "LL") — the selection is deleted
-      // but the parsed <a> element is silently discarded, leaving no link.
-      // Root cause unknown (likely a ProseMirror schema/parser edge case).
-      // When this happens we return false so the caller falls back to the
-      // external DB-write path (insertLink).
-      //
-      // TODO: Investigate why ProseMirror insertHTML drops short <a> tags
-      // and remove this workaround when fixed upstream.
+      // Correctness check: ProseMirror's insertHTML can silently drop content
+      // (e.g. short <a> tags, or HTML that doesn't match the schema). Detect a
+      // no-op by comparing contenteditable text length before/after; the insert
+      // must replace `fullTrigger` and add at least one char.
       const ceBefore =
         editorWin.document.querySelector('[contenteditable="true"]')
           ?.textContent ?? "";
-      inst._postMessage({ action: "insertHTML", html: linkHtml });
+      inst._postMessage({ action: "insertHTML", html });
       await new Promise((resolve) => setTimeout(resolve, 0));
       const ceAfter =
         editorWin.document.querySelector('[contenteditable="true"]')
           ?.textContent ?? "";
-      const minLen = ceBefore.length - fullTrigger.length;
-      const ok = ceAfter.length > minLen;
-      Zotero.debug(
-        `[FastLink] insertLinkViaEditor "${triggerText}" ok=${ok}`,
-      );
+      const ok = ceAfter.length > ceBefore.length - fullTrigger.length;
+      Zotero.debug(`[FastLink] insertHtmlAtTrigger "${fullTrigger}" ok=${ok}`);
       if (!ok) {
         this.clearSavedSelection();
         return false;
@@ -108,7 +104,7 @@ export class LinkInserter {
       this.clearSavedSelection();
       return true;
     } catch (e) {
-      Zotero.debug(`[FastLink] insertLinkViaEditor error: ${e}`);
+      Zotero.debug(`[FastLink] insertHtmlAtTrigger error: ${e}`);
       return false;
     }
   }
@@ -129,7 +125,10 @@ export class LinkInserter {
       if (this._savedRange) {
         try {
           const ec = this._savedRange.endContainer;
-          if (ec.nodeType === 3 /* Node.TEXT_NODE */ && ec.ownerDocument === editorWin.document) {
+          if (
+            ec.nodeType === 3 /* Node.TEXT_NODE */ &&
+            ec.ownerDocument === editorWin.document
+          ) {
             const textBefore = (ec.nodeValue ?? "").slice(
               0,
               this._savedRange.endOffset,
@@ -207,6 +206,40 @@ export class LinkInserter {
       return true;
     } catch (e) {
       Zotero.debug(`[FastLink] copyLinkToClipboard error: ${e}`);
+      return false;
+    }
+  }
+
+  /**
+   * Lightweight DB-write fallback for slash commands: find the last occurrence
+   * of `triggerToken` (e.g. "/todo") in the LIVE editor HTML, replace it with
+   * `html`, and save. Used only when insertHtmlAtTrigger fails. Simpler than the
+   * link path — no createNote/autosave race and no image involvement.
+   */
+  async insertReplacementViaDb(
+    triggerToken: string,
+    html: string,
+  ): Promise<boolean> {
+    try {
+      const editorWindow = this._savedWindow || getEditorWindow();
+      const contentEl = getEditorContentElement(editorWindow);
+      if (!contentEl) return false;
+      const liveHtml = String(contentEl.innerHTML);
+      const idx = liveHtml.lastIndexOf(triggerToken);
+      if (idx < 0) return false;
+      const newHtml =
+        liveHtml.slice(0, idx) +
+        html +
+        liveHtml.slice(idx + triggerToken.length);
+
+      const note = getCurrentNote(editorWindow);
+      if (!note) return false;
+      note.setNote(this.cleanProseMirrorHtml(newHtml));
+      await note.saveTx();
+      this.clearSavedSelection();
+      return true;
+    } catch (e) {
+      Zotero.debug(`[FastLink] insertReplacementViaDb error: ${e}`);
       return false;
     }
   }
