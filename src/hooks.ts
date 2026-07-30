@@ -1,11 +1,13 @@
 import { NoteLinkAutocomplete } from "./modules/note-link-autocomplete";
 import { QuickCreateHandler } from "./modules/quick-create-handler";
+import { SlashCommandHandler } from "./modules/slash-command-handler";
 import { NoteSearchService } from "./modules/note-search-service";
 import { LinkInserter } from "./modules/link-inserter";
 import { initLocale } from "./utils/locale";
 
 let autocomplete: NoteLinkAutocomplete | null = null;
 let quickCreate: QuickCreateHandler | null = null;
+let slashCommands: SlashCommandHandler | null = null;
 
 const sharedSearchService = new NoteSearchService();
 const sharedLinkInserter = new LinkInserter();
@@ -38,6 +40,10 @@ async function onStartup() {
       sharedLinkInserter,
     );
     await quickCreate.initialize();
+
+    slashCommands = new SlashCommandHandler(sharedLinkInserter);
+    slashCommands.initialize();
+    (addon as any).slashCommands = slashCommands;
 
     try {
       addon.data.ztoolkit.Keyboard.register((ev, _keyOptions) => {
@@ -80,10 +86,12 @@ function onMainWindowLoad(win: _ZoteroTypes.MainWindow): void {
   // in their own window too. attachToWindow is idempotent and a no-op before
   // initialize() has bound the handlers (e.g. during the startup window loop).
   autocomplete?.attachToWindow(win);
+  slashCommands?.attachToWindow(win);
 }
 
 function onMainWindowUnload(win: Window): void {
   autocomplete?.detachFromWindow(win);
+  slashCommands?.detachFromWindow(win);
   addon.data.ztoolkit.unregisterAll();
 }
 
@@ -93,6 +101,10 @@ function onShutdown(): void {
   quickCreate = null;
   autocomplete = null;
   (addon as any).autocomplete = undefined;
+
+  slashCommands?.destroy();
+  slashCommands = null;
+  (addon as any).slashCommands = undefined;
 
   addon.data.ztoolkit.unregisterAll();
   addon.data.alive = false;
